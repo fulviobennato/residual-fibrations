@@ -13,68 +13,57 @@ permissions:
 jobs:
   gate3:
     runs-on: ubuntu-latest
-    container:
-      image: python:3.13.7-slim-bookworm@sha256:781449467ffb6f04218f09b1ecdcdc7d22b289ee5da9ec498b024e24ad7a6db7
-      options: >-
-        --read-only
-        --user 65534:65534
-        --cap-drop ALL
-        --security-opt no-new-privileges
-        --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m
     env:
       SCC_IMAGE: python:3.13.7-slim-bookworm
       SCC_IMAGE_DIGEST: sha256:781449467ffb6f04218f09b1ecdcdc7d22b289ee5da9ec498b024e24ad7a6db7
       SCC_PLATFORM: linux/amd64
     steps:
-      - name: Measure runtime pre
-        shell: sh
+      - name: Prepare isolated output directory
+        shell: bash
         run: |
-          cat > /tmp/gate3_measure.py <<'PY'
-          import hashlib, json, os, pathlib, sys, sysconfig
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scc-gate3-out"
+          chmod 0777 "$RUNNER_TEMP/scc-gate3-out"
 
+      - name: Run pinned read-only non-root runtime probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$SCC_IMAGE@$SCC_IMAGE_DIGEST"
+          cat > "$RUNNER_TEMP/gate3_measure.py" <<'PY'
+          import hashlib, json, os, pathlib, sys, sysconfig
           def hfile(p):
               h=hashlib.sha256()
               with open(p,'rb') as f:
                   for b in iter(lambda:f.read(1024*1024), b''):
                       h.update(b)
               return h.hexdigest()
-
           roots=[]
           for k in ('stdlib','platstdlib','purelib','platlib'):
               v=sysconfig.get_paths().get(k)
-              if v and v not in roots:
-                  roots.append(v)
+              if v and v not in roots: roots.append(v)
           dyn=os.path.join(sysconfig.get_paths()['stdlib'],'lib-dynload')
-          if os.path.isdir(dyn) and dyn not in roots:
-              roots.append(dyn)
-
+          if os.path.isdir(dyn) and dyn not in roots: roots.append(dyn)
           files=[]
           for root in sorted(roots):
               rp=pathlib.Path(root)
-              if not rp.exists():
-                  continue
+              if not rp.exists(): continue
               for p in sorted(x for x in rp.rglob('*') if x.is_file()):
-                  try:
-                      files.append((str(p), hfile(p), p.stat().st_size))
-                  except (PermissionError, OSError):
-                      pass
-
+                  try: files.append((str(p),hfile(p),p.stat().st_size))
+                  except (PermissionError,OSError): pass
           surface=hashlib.sha256()
           for p,h,n in files:
               surface.update(p.encode()+b'\0'+h.encode()+b'\0'+str(n).encode()+b'\n')
-
           write_tests={}
           for root in roots:
               probe=os.path.join(root,'.scc_gate3_write_probe')
               try:
-                  with open(probe,'wb') as f:
-                      f.write(b'x')
+                  with open(probe,'wb') as f: f.write(b'x')
                   write_tests[root]='WRITE_SUCCEEDED'
                   try: os.remove(probe)
                   except OSError: pass
               except Exception as e:
                   write_tests[root]=type(e).__name__
-
           root_mount=None
           try:
               for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
@@ -84,12 +73,10 @@ jobs:
                       break
           except Exception:
               pass
-
           rec={
               'python_version':sys.version,
               'python_executable':sys.executable,
-              'uid':os.getuid(),
-              'gid':os.getgid(),
+              'uid':os.getuid(),'gid':os.getgid(),
               'roots':roots,
               'root_writable_os_access':{r:os.access(r,os.W_OK) for r in roots},
               'write_tests':write_tests,
@@ -101,64 +88,57 @@ jobs:
               'platform':os.environ.get('SCC_PLATFORM'),
               'github_sha':os.environ.get('GITHUB_SHA'),
               'github_run_id':os.environ.get('GITHUB_RUN_ID'),
-              'github_run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT'),
+              'github_run_attempt':os.environ.get('GITHUB_RUN_ATTEMPT')
           }
           print(json.dumps(rec,sort_keys=True))
           PY
-          python -I -B -S /tmp/gate3_measure.py > /tmp/pre.json
-          cat /tmp/pre.json
 
-      - name: Exercise isolated Python runtime
-        shell: sh
-        run: |
-          python -I -B -S -c "import hashlib,json,ssl,sqlite3,math,zlib; print('isolated-runtime-ok')"
-
-      - name: Measure runtime post and emit receipt
-        shell: sh
-        run: |
-          python -I -B -S /tmp/gate3_measure.py > /tmp/post.json
-          python -I -B -S - <<'PY'
-          import json, os
-          pre=json.load(open('/tmp/pre.json'))
-          post=json.load(open('/tmp/post.json'))
-          same=pre['runtime_surface_sha256']==post['runtime_surface_sha256']
-          roots_nowrite=all(v!='WRITE_SUCCEEDED' for v in post['write_tests'].values())
-          roots_access_nowrite=not any(post['root_writable_os_access'].values())
-          nonroot=post['uid']!=0
-          root_ro=bool(post.get('root_mountinfo')) and ' ro,' in post['root_mountinfo']
+          docker run --rm             --read-only             --user 65534:65534             --cap-drop ALL             --security-opt no-new-privileges             --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m             -v "$RUNNER_TEMP/gate3_measure.py:/probe/gate3_measure.py:ro"             -v "$RUNNER_TEMP/scc-gate3-out:/out:rw"             -e SCC_IMAGE="$SCC_IMAGE"             -e SCC_IMAGE_DIGEST="$SCC_IMAGE_DIGEST"             -e SCC_PLATFORM="$SCC_PLATFORM"             -e GITHUB_SHA="$GITHUB_SHA"             -e GITHUB_RUN_ID="$GITHUB_RUN_ID"             -e GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT"             "$SCC_IMAGE@$SCC_IMAGE_DIGEST"             sh -lc '
+              set -e
+              python -I -B -S /probe/gate3_measure.py > /tmp/pre.json
+              python -I -B -S -c "import hashlib,json,ssl,sqlite3,math,zlib; print(\"isolated-runtime-ok\")"
+              python -I -B -S /probe/gate3_measure.py > /tmp/post.json
+              python -I -B -S - <<"PY2"
+          import json
+          pre=json.load(open("/tmp/pre.json"))
+          post=json.load(open("/tmp/post.json"))
           checks={
-            'pinned_image_digest': post['image_digest']=='sha256:781449467ffb6f04218f09b1ecdcdc7d22b289ee5da9ec498b024e24ad7a6db7',
-            'non_root_execution_principal': nonroot,
-            'dependency_roots_not_writable_by_access': roots_access_nowrite,
-            'dependency_roots_write_attempts_failed': roots_nowrite,
-            'runtime_surface_identical_pre_post': same,
-            'root_mount_reports_read_only': root_ro,
+            "pinned_image_digest": post["image_digest"]=="sha256:781449467ffb6f04218f09b1ecdcdc7d22b289ee5da9ec498b024e24ad7a6db7",
+            "non_root_execution_principal": post["uid"]!=0,
+            "dependency_roots_not_writable_by_access": not any(post["root_writable_os_access"].values()),
+            "dependency_roots_write_attempts_failed": all(v!="WRITE_SUCCEEDED" for v in post["write_tests"].values()),
+            "runtime_surface_identical_pre_post": pre["runtime_surface_sha256"]==post["runtime_surface_sha256"],
+            "root_mount_reports_read_only": bool(post.get("root_mountinfo")) and " ro," in post["root_mountinfo"]
           }
-          first_blocker=next((k for k,v in checks.items() if not v),None)
           receipt={
-            'schema':'scc-gate3-runtime-custody-probe/1',
-            'checks':checks,
-            'gate3_runtime_local_conditions_pass':all(checks.values()),
-            'first_blocker':first_blocker,
-            'pre':pre,
-            'post':post,
-            'note':'This receipt covers runtime immutability/no-write and identity continuity in one GitHub-hosted job. Independent provenance is supplied separately by GitHub artifact attestation.'
+            "schema":"scc-gate3-runtime-custody-probe/2",
+            "checks":checks,
+            "gate3_runtime_local_conditions_pass":all(checks.values()),
+            "first_blocker":next((k for k,v in checks.items() if not v),None),
+            "pre":pre,"post":post,
+            "note":"Digest-pinned read-only non-root container; publication and attestation happen on the GitHub-hosted runner outside the constrained container."
           }
-          with open('/tmp/gate3_receipt.json','w') as f:
+          with open("/out/gate3_receipt.json","w") as f:
               json.dump(receipt,f,sort_keys=True,indent=2)
           print(json.dumps(receipt,sort_keys=True))
-          if not all(checks.values()):
-              raise SystemExit(2)
-          PY
+          if not all(checks.values()): raise SystemExit(2)
+          PY2
+            '
+
+      - name: Hash receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum "$RUNNER_TEMP/scc-gate3-out/gate3_receipt.json"
 
       - name: Upload Gate-3 receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: scc-gate3-runtime-custody-receipt
-          path: /tmp/gate3_receipt.json
+          path: ${{ runner.temp }}/scc-gate3-out/gate3_receipt.json
           if-no-files-found: error
 
       - name: Attest Gate-3 receipt
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: /tmp/gate3_receipt.json
+          subject-path: ${{ runner.temp }}/scc-gate3-out/gate3_receipt.json
