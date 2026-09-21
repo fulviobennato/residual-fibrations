@@ -1,0 +1,318 @@
+name: SCC P503 Private Benchmark OCI Custody
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  EXPECTED_BENCHMARK_ZIP_SHA256: 35e257503ff1c4d36f30634b19c5da570288dd264ec710331a69dcfed776659c
+  EXPECTED_BENCHMARK_ZIP_BYTES: "381280"
+  EXPECTED_MEMBER_COUNT: "243"
+  EXPECTED_PACK_XZ_SHA256: 54f95722384566b202808fff036e8c6bd38b412c836e361a8c0aaa13014b88d5
+  EXPECTED_PACK_XZ_BYTES: "145860"
+  CHUNK0_SHA256: 9ab45e2e3963cda1c78ad8191afc816342e09ef317ebd1a64d85dd72d285b6a3
+  CHUNK1_SHA256: 7184f58e54b9b873bf5c8d8b0c57a3d30103384d912432f1a24467086de5950a
+  CHUNK2_SHA256: 3ac024203c4d3c0f73fe3584f60b87c22570ec1939c30849024d1e0bf81e84ef
+  CHUNK3_SHA256: b2bea46722b9acf70b657bf333c4dc7bd7799d1bc32ba184cbb3e30063d1cdf4
+  EXPECTED_CHUNK_CHARS: "48620"
+  BASE_IMAGE_REF: python:3.13.7-slim-bookworm
+  BASE_IMAGE_DIGEST: sha256:781449467ffb6f04218f09b1ecdcdc7d22b289ee5da9ec498b024e24ad7a6db7
+  TARGET_PLATFORM: linux/amd64
+  IMAGE_NAME: ghcr.io/fulviobennato/scc-benchmark-v0613-custodied
+  PACKAGE_NAME: scc-benchmark-v0613-custodied
+  LOCAL_IMAGE: scc-benchmark-v0613-p503:local
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-latest
+    outputs:
+      manifest_digest: ${{ steps.push.outputs.manifest_digest }}
+      digest_ref: ${{ steps.push.outputs.digest_ref }}
+      recipe_sha: ${{ steps.recipe.outputs.recipe_sha }}
+      docker_client: ${{ steps.recipe.outputs.docker_client }}
+      docker_server: ${{ steps.recipe.outputs.docker_server }}
+    steps:
+      - name: Require private benchmark chunks and registry PAT
+        shell: bash
+        env:
+          C0: ${{ secrets.SCC_BENCHMARK_V0613_B64_00 }}
+          C1: ${{ secrets.SCC_BENCHMARK_V0613_B64_01 }}
+          C2: ${{ secrets.SCC_BENCHMARK_V0613_B64_02 }}
+          C3: ${{ secrets.SCC_BENCHMARK_V0613_B64_03 }}
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          for n in 0 1 2 3; do
+            v="C$n"
+            [[ -n "${!v:-}" ]] || { echo "::error::SCC_BENCHMARK_V0613_B64_0$n absent"; exit $((80+n)); }
+          done
+          [[ -n "${SCC_GHCR_PAT:-}" ]] || { echo "::error::SCC_GHCR_PAT absent"; exit 79; }
+
+      - name: Reconstruct exact frozen benchmark privately
+        shell: bash
+        env:
+          C0: ${{ secrets.SCC_BENCHMARK_V0613_B64_00 }}
+          C1: ${{ secrets.SCC_BENCHMARK_V0613_B64_01 }}
+          C2: ${{ secrets.SCC_BENCHMARK_V0613_B64_02 }}
+          C3: ${{ secrets.SCC_BENCHMARK_V0613_B64_03 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/scc-p503"
+          mkdir -p "$work/private" "$work/context"
+          printf '%s' "$C0" > "$work/private/c0"
+          printf '%s' "$C1" > "$work/private/c1"
+          printf '%s' "$C2" > "$work/private/c2"
+          printf '%s' "$C3" > "$work/private/c3"
+          unset C0 C1 C2 C3
+          for n in 0 1 2 3; do
+            test "$(wc -c < "$work/private/c$n")" -eq "$EXPECTED_CHUNK_CHARS"
+            expected_var="CHUNK${n}_SHA256"
+            test "$(sha256sum "$work/private/c$n" | awk '{print $1}')" = "${!expected_var}"
+          done
+          cat "$work/private"/c{0,1,2,3} > "$work/private/payload.b64"
+          base64 --decode "$work/private/payload.b64" > "$work/private/tree.pack.xz"
+          test "$(wc -c < "$work/private/tree.pack.xz")" -eq "$EXPECTED_PACK_XZ_BYTES"
+          test "$(sha256sum "$work/private/tree.pack.xz" | awk '{print $1}')" = "$EXPECTED_PACK_XZ_SHA256"
+          python3 -I -B - <<'PY'
+          import hashlib,lzma,os,pathlib,struct,zipfile
+          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p503"
+          raw=lzma.decompress((work/"private"/"tree.pack.xz").read_bytes())
+          pos=0; magic=b"SCCBT1\0"
+          if raw[:len(magic)]!=magic: raise SystemExit("bad magic")
+          pos=len(magic); count=struct.unpack_from(">I",raw,pos)[0]; pos+=4
+          if count!=int(os.environ["EXPECTED_MEMBER_COUNT"]): raise SystemExit("member count")
+          entries=[]; seen=set()
+          for _ in range(count):
+              nl=struct.unpack_from(">H",raw,pos)[0]; pos+=2
+              name=raw[pos:pos+nl].decode(); pos+=nl
+              sz=struct.unpack_from(">Q",raw,pos)[0]; pos+=8
+              data=raw[pos:pos+sz]; pos+=sz
+              p=pathlib.PurePosixPath(name)
+              if p.is_absolute() or ".." in p.parts or name in seen: raise SystemExit("unsafe/duplicate")
+              seen.add(name); entries.append((name,data))
+          if pos!=len(raw) or [n for n,_ in entries]!=sorted(n for n,_ in entries): raise SystemExit("noncanonical payload")
+          out=work/"context"/"SCC_benchmark_core_v0_6_13.zip"
+          with zipfile.ZipFile(out,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=9,strict_timestamps=True) as zo:
+              for name,data in entries:
+                  zi=zipfile.ZipInfo(name,date_time=(2026,9,20,0,0,0))
+                  zi.create_system=3; zi.external_attr=(0o100644<<16); zi.compress_type=zipfile.ZIP_DEFLATED
+                  zo.writestr(zi,data,compress_type=zipfile.ZIP_DEFLATED,compresslevel=9)
+          h=hashlib.sha256(out.read_bytes()).hexdigest()
+          if h!=os.environ["EXPECTED_BENCHMARK_ZIP_SHA256"]: raise SystemExit(f"ZIP hash {h}")
+          if out.stat().st_size!=int(os.environ["EXPECTED_BENCHMARK_ZIP_BYTES"]): raise SystemExit("ZIP size")
+          PY
+
+      - name: Create deterministic benchmark transport image recipe
+        id: recipe
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/scc-p503"
+          cat > "$work/context/Dockerfile" <<EOF
+          FROM $BASE_IMAGE_REF@$BASE_IMAGE_DIGEST
+          WORKDIR /frozen
+          COPY --chown=65534:65534 SCC_benchmark_core_v0_6_13.zip /frozen/SCC_benchmark_core_v0_6_13.zip
+          USER 65534:65534
+          ENTRYPOINT ["python","-c","import hashlib,pathlib; p=pathlib.Path('/frozen/SCC_benchmark_core_v0_6_13.zip'); print(hashlib.sha256(p.read_bytes()).hexdigest())"]
+          EOF
+          docker pull --platform "$TARGET_PLATFORM" "$BASE_IMAGE_REF@$BASE_IMAGE_DIGEST" >/dev/null
+          docker_client="$(docker version --format '{{.Client.Version}}')"
+          docker_server="$(docker version --format '{{.Server.Version}}')"
+          export P503_DOCKER_CLIENT="$docker_client" P503_DOCKER_SERVER="$docker_server"
+          recipe_sha="$(python3 -I -B - <<'PY'
+          import hashlib,json,os
+          rec={
+            "benchmark_zip_sha256":os.environ["EXPECTED_BENCHMARK_ZIP_SHA256"],
+            "transport_pack_xz_sha256":os.environ["EXPECTED_PACK_XZ_SHA256"],
+            "base_ref":os.environ["BASE_IMAGE_REF"],
+            "base_digest":os.environ["BASE_IMAGE_DIGEST"],
+            "platform":os.environ["TARGET_PLATFORM"],
+            "image_name":os.environ["IMAGE_NAME"],
+            "docker_client":os.environ["P503_DOCKER_CLIENT"],
+            "docker_server":os.environ["P503_DOCKER_SERVER"],
+            "github_repository":os.environ.get("GITHUB_REPOSITORY"),
+            "github_sha":os.environ.get("GITHUB_SHA"),
+          }
+          print(hashlib.sha256(json.dumps(rec,sort_keys=True,separators=(",",":")).encode()).hexdigest())
+          PY
+          )"
+          echo "docker_client=$docker_client" >> "$GITHUB_OUTPUT"
+          echo "docker_server=$docker_server" >> "$GITHUB_OUTPUT"
+          echo "recipe_sha=$recipe_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Build benchmark transport image locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --no-cache --pull=false --platform "$TARGET_PLATFORM" -t "$LOCAL_IMAGE" "$RUNNER_TEMP/scc-p503/context"
+          got="$(docker run --rm "$LOCAL_IMAGE")"
+          test "$got" = "$EXPECTED_BENCHMARK_ZIP_SHA256"
+
+      - name: Publish first private benchmark package via PAT
+        id: push
+        shell: bash
+        env:
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          tag="$IMAGE_NAME:$GITHUB_SHA"
+          echo "$SCC_GHCR_PAT" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          docker tag "$LOCAL_IMAGE" "$tag"
+          docker push "$tag" 2>&1 | tee "$RUNNER_TEMP/scc-p503/push.log"
+          digest="$(awk '/digest: sha256:/{print $2}' "$RUNNER_TEMP/scc-p503/push.log" | tail -1)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::manifest digest missing"; exit 6; }
+          echo "manifest_digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "digest_ref=$IMAGE_NAME@$digest" >> "$GITHUB_OUTPUT"
+          docker logout ghcr.io >/dev/null || true
+
+      - name: Immediate private visibility check
+        shell: bash
+        env:
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          meta="$(mktemp)"
+          curl -fsSL -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $SCC_GHCR_PAT" -H "X-GitHub-Api-Version: 2026-03-10" "https://api.github.com/user/packages/container/$PACKAGE_NAME" > "$meta"
+          python3 -I -B - "$meta" <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1]))
+          assert x.get("package_type")=="container"
+          assert x.get("visibility")=="private"
+          PY
+
+  independent-inspection:
+    needs: build-publish
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_MANIFEST_DIGEST: ${{ needs.build-publish.outputs.manifest_digest }}
+      IMAGE_DIGEST_REF: ${{ needs.build-publish.outputs.digest_ref }}
+      BUILD_RECIPE_SHA256: ${{ needs.build-publish.outputs.recipe_sha }}
+      DOCKER_CLIENT_BUILD: ${{ needs.build-publish.outputs.docker_client }}
+      DOCKER_SERVER_BUILD: ${{ needs.build-publish.outputs.docker_server }}
+    steps:
+      - name: Require PAT and exact digest outputs
+        shell: bash
+        env:
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          [[ -n "${SCC_GHCR_PAT:-}" ]] || { echo "::error::SCC_GHCR_PAT absent"; exit 79; }
+          [[ "$IMAGE_MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$IMAGE_DIGEST_REF" == "$IMAGE_NAME@$IMAGE_MANIFEST_DIGEST" ]]
+          mkdir -p "$RUNNER_TEMP/scc-p503-inspect/out"
+
+      - name: Recheck package metadata private
+        shell: bash
+        env:
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/scc-p503-inspect/package_metadata.json"
+          curl -fsSL -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $SCC_GHCR_PAT" -H "X-GitHub-Api-Version: 2026-03-10" "https://api.github.com/user/packages/container/$PACKAGE_NAME" > "$out"
+          python3 -I -B - "$out" <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1]))
+          if x.get("package_type")!="container" or x.get("visibility")!="private": raise SystemExit("package not private container")
+          clean={k:x.get(k) for k in ("id","name","package_type","visibility","version_count","created_at","updated_at","html_url")}
+          json.dump(clean,open(sys.argv[1],"w"),sort_keys=True,indent=2); open(sys.argv[1],"a").write("\n")
+          PY
+
+      - name: Prove anonymous exact-digest pull rejected
+        shell: bash
+        run: |
+          set -euo pipefail
+          cfg="$RUNNER_TEMP/scc-p503-inspect/anon"; mkdir -p "$cfg"
+          if DOCKER_CONFIG="$cfg" docker pull "$IMAGE_DIGEST_REF" > "$RUNNER_TEMP/scc-p503-inspect/anon.log" 2>&1; then
+            echo "::error::anonymous pull succeeded"; exit 7
+          fi
+          echo ANONYMOUS_PULL_REJECTED > "$RUNNER_TEMP/scc-p503-inspect/anon.status"
+
+      - name: Authenticated exact-digest pull
+        shell: bash
+        env:
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          cfg="$RUNNER_TEMP/scc-p503-inspect/auth"; mkdir -p "$cfg"
+          echo "$SCC_GHCR_PAT" | DOCKER_CONFIG="$cfg" docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          DOCKER_CONFIG="$cfg" docker pull "$IMAGE_DIGEST_REF"
+          got="$(docker run --rm "$IMAGE_DIGEST_REF")"
+          test "$got" = "$EXPECTED_BENCHMARK_ZIP_SHA256"
+          echo AUTHENTICATED_PULL_PASS > "$RUNNER_TEMP/scc-p503-inspect/auth.status"
+          DOCKER_CONFIG="$cfg" docker logout ghcr.io >/dev/null || true
+
+      - name: Write benchmark OCI custody receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -B - <<'PY'
+          import json,os,pathlib,subprocess
+          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p503-inspect"
+          pkg=json.load(open(work/"package_metadata.json"))
+          insp=json.loads(subprocess.check_output(["docker","image","inspect",os.environ["IMAGE_DIGEST_REF"]]))[0]
+          cfg=insp.get("Config") or {}
+          repo=insp.get("RepoDigests") or []
+          checks={
+            "package_private":pkg.get("visibility")=="private",
+            "anonymous_pull_rejected":(work/"anon.status").read_text().strip()=="ANONYMOUS_PULL_REJECTED",
+            "authenticated_pull_pass":(work/"auth.status").read_text().strip()=="AUTHENTICATED_PULL_PASS",
+            "digest_bound":any(os.environ["IMAGE_MANIFEST_DIGEST"] in x for x in repo),
+            "user":cfg.get("User")=="65534:65534",
+            "workdir":cfg.get("WorkingDir")=="/frozen",
+          }
+          rec={
+            "schema":"scc-private-benchmark-oci-custody/1",
+            "pass":all(checks.values()),
+            "checks":checks,
+            "benchmark_zip_sha256":os.environ["EXPECTED_BENCHMARK_ZIP_SHA256"],
+            "benchmark_zip_bytes":int(os.environ["EXPECTED_BENCHMARK_ZIP_BYTES"]),
+            "transport_pack_xz_sha256":os.environ["EXPECTED_PACK_XZ_SHA256"],
+            "build":{
+              "base_ref":os.environ["BASE_IMAGE_REF"],
+              "base_digest":os.environ["BASE_IMAGE_DIGEST"],
+              "platform":os.environ["TARGET_PLATFORM"],
+              "build_recipe_invocation_sha256":os.environ["BUILD_RECIPE_SHA256"],
+              "docker_client_version":os.environ["DOCKER_CLIENT_BUILD"],
+              "docker_server_version":os.environ["DOCKER_SERVER_BUILD"],
+            },
+            "image":{
+              "name":os.environ["IMAGE_NAME"],
+              "manifest_digest":os.environ["IMAGE_MANIFEST_DIGEST"],
+              "digest_ref":os.environ["IMAGE_DIGEST_REF"],
+              "repo_digests":repo,
+              "config":{"Entrypoint":cfg.get("Entrypoint"),"WorkingDir":cfg.get("WorkingDir"),"User":cfg.get("User")},
+            },
+            "package":pkg,
+            "privacy":{"benchmark_uploaded_as_public_artifact":False,"benchmark_secret_chunks_available_to_inspection_job":False},
+            "github":{"repository":os.environ.get("GITHUB_REPOSITORY"),"sha":os.environ.get("GITHUB_SHA"),"run_id":os.environ.get("GITHUB_RUN_ID"),"run_attempt":os.environ.get("GITHUB_RUN_ATTEMPT")}
+          }
+          out=work/"out"/"p503_private_benchmark_oci_custody_receipt.json"
+          out.write_text(json.dumps(rec,sort_keys=True,indent=2)+"\n")
+          print(json.dumps({"pass":rec["pass"],"digest_ref":rec["image"]["digest_ref"],"checks":checks},sort_keys=True))
+          if not rec["pass"]: raise SystemExit(9)
+          PY
+          sha256sum "$RUNNER_TEMP/scc-p503-inspect/out/p503_private_benchmark_oci_custody_receipt.json"
+
+      - name: Upload non-secret receipt only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-p503-private-benchmark-oci-custody-receipt
+          path: ${{ runner.temp }}/scc-p503-inspect/out/p503_private_benchmark_oci_custody_receipt.json
+          if-no-files-found: error
+
+      - name: Attest receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/scc-p503-inspect/out/p503_private_benchmark_oci_custody_receipt.json
+
+      - name: Attest exact benchmark OCI subject
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.build-publish.outputs.manifest_digest }}
+          push-to-registry: false
