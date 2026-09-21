@@ -90,28 +90,96 @@ jobs:
           fi
           echo "image_ref=$digest" >> "$GITHUB_OUTPUT"
           echo "image_name=$image" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image:$tag" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${digest#*@}" >> "$GITHUB_OUTPUT"
 
-      - name: Pull by digest and inspect
+      - name: Verify GHCR package metadata reports private
+        id: package_privacy
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ steps.push.outputs.image_name }}
+        run: |
+          set -euo pipefail
+          package="${IMAGE_NAME##*/}"
+          visibility="$(gh api -H "Accept: application/vnd.github+json" "/user/packages/container/$package" --jq '.visibility')"
+          test "$visibility" = "private" || {
+            echo "::error::GHCR package metadata did not report private visibility."
+            exit 79
+          }
+          echo "package_visibility=$visibility" >> "$GITHUB_OUTPUT"
+
+      - name: Prove anonymous pull by exact digest is rejected
+        id: anonymous_pull
         shell: bash
         env:
           IMAGE_REF: ${{ steps.push.outputs.image_ref }}
+          IMAGE_TAG: ${{ steps.push.outputs.image_tag }}
         run: |
           set -euo pipefail
-          docker image rm "$IMAGE_REF" >/dev/null 2>&1 || true
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          docker image rm -f "$IMAGE_REF" "$IMAGE_TAG" >/dev/null 2>&1 || true
+          set +e
+          anon_out="$(docker pull "$IMAGE_REF" 2>&1)"
+          anon_rc=$?
+          set -e
+          if [[ "$anon_rc" -eq 0 ]]; then
+            echo "::error::Anonymous pull unexpectedly succeeded; private custody fails closed."
+            exit 79
+          fi
+          if ! grep -Eiq 'denied|unauthorized|authentication required|not authorized|requested access' <<<"$anon_out"; then
+            echo "::error::Anonymous pull failed for a non-authentication-specific reason; privacy proof is inconclusive."
+            exit 79
+          fi
+          anon_hash="$(printf '%s' "$anon_out" | sha256sum | awk '{print $1}')"
+          echo "anonymous_pull_rejected=true" >> "$GITHUB_OUTPUT"
+          echo "anonymous_error_sha256=$anon_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Re-authenticate and pull exact digest
+        id: authenticated_pull
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.push.outputs.image_ref }}
+          IMAGE_TAG: ${{ steps.push.outputs.image_tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin >/dev/null
           docker pull "$IMAGE_REF"
+          mapfile -t repo_digests < <(docker image inspect "$IMAGE_REF" --format='{{range .RepoDigests}}{{println .}}{{end}}')
+          printf '%s\n' "${repo_digests[@]}" | grep -Fx -- "$IMAGE_REF" >/dev/null || {
+            echo "::error::Authenticated pull did not materialize the exact pushed digest."
+            exit 79
+          }
+          echo "authenticated_pull_succeeded=true" >> "$GITHUB_OUTPUT"
+          echo "digest_equality=true" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect pulled image and write custody receipt
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.push.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.image_digest }}
+          PACKAGE_VISIBILITY: ${{ steps.package_privacy.outputs.package_visibility }}
+          ANON_REJECTED: ${{ steps.anonymous_pull.outputs.anonymous_pull_rejected }}
+          ANON_ERROR_SHA256: ${{ steps.anonymous_pull.outputs.anonymous_error_sha256 }}
+          AUTH_PULL_SUCCEEDED: ${{ steps.authenticated_pull.outputs.authenticated_pull_succeeded }}
+          DIGEST_EQUALITY: ${{ steps.authenticated_pull.outputs.digest_equality }}
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json, os, subprocess
           ref=os.environ["IMAGE_REF"]
           obj=json.loads(subprocess.check_output(["docker","image","inspect",ref]))[0]
           cfg=obj.get("Config") or {}
           receipt={
-            "schema":"scc-private-repo-bootstrap/1",
+            "schema":"scc-private-repo-bootstrap/2",
             "repository":os.environ["GITHUB_REPOSITORY"],
             "repository_private":True,
             "commit":os.environ["GITHUB_SHA"],
             "adapter_zip_sha256":os.environ["EXPECTED_ADAPTER_SHA256"],
             "benchmark_zip_sha256":os.environ["EXPECTED_BENCHMARK_SHA256"],
             "image_ref":ref,
+            "image_digest":os.environ["IMAGE_DIGEST"],
             "image_id":obj.get("Id"),
             "architecture":obj.get("Architecture"),
             "os":obj.get("Os"),
@@ -121,10 +189,15 @@ jobs:
               "WorkingDir":cfg.get("WorkingDir"),
               "User":cfg.get("User"),
             },
+            "package_visibility":os.environ["PACKAGE_VISIBILITY"],
+            "anonymous_pull_rejected":os.environ["ANON_REJECTED"]=="true",
+            "anonymous_error_sha256":os.environ["ANON_ERROR_SHA256"],
+            "authenticated_pull_by_digest_succeeded":os.environ["AUTH_PULL_SUCCEEDED"]=="true",
+            "pulled_digest_equals_pushed_digest":os.environ["DIGEST_EQUALITY"]=="true",
             "transport_secret_count_for_adapter_and_benchmark":0,
             "ghcr_pat_used":False,
             "github_token_used":True,
-            "status":"PRIVATE_REPO_BOOTSTRAP_IMAGE_PUSHED_PENDING_PRIVACY_PROOF"
+            "status":"PRIVATE_PACKAGE_CUSTODY_PASS"
           }
           p=os.path.join(os.environ["RUNNER_TEMP"],"private_repo_bootstrap_receipt.json")
           open(p,"w").write(json.dumps(receipt,sort_keys=True,indent=2)+"\n")
@@ -147,4 +220,4 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-name: ${{ steps.push.outputs.image_name }}
-          subject-digest: ${{ steps.push.outputs.image_ref }}
+          subject-digest: ${{ steps.push.outputs.image_digest }}
