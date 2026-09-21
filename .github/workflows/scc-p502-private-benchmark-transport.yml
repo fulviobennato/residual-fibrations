@@ -1,0 +1,162 @@
+name: SCC P502 Private Benchmark Transport
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  EXPECTED_BENCHMARK_ZIP_SHA256: 35e257503ff1c4d36f30634b19c5da570288dd264ec710331a69dcfed776659c
+  EXPECTED_BENCHMARK_ZIP_BYTES: "381280"
+  EXPECTED_MEMBER_COUNT: "243"
+  EXPECTED_PACK_XZ_SHA256: 54f95722384566b202808fff036e8c6bd38b412c836e361a8c0aaa13014b88d5
+  EXPECTED_PACK_XZ_BYTES: "145860"
+  EXPECTED_MANIFEST_SHA256: bf4aa3668dc58ddc8cb0cf2c6a82d319e74435bb2910089463d8eeafd55a728c
+  EXPECTED_RELEASE_RECEIPT_SHA256: b66dd121910b6c07462c08afc51d0c23f1e882570d6b43e8e2d7abf834bec423
+  EXPECTED_RUNTIME_SURFACE_SHA256: 3c1f5c422ed0217c1b7e93cdf6ccf947be02d00606b885111ad7d4eb92e7428d
+  CHUNK0_SHA256: 9ab45e2e3963cda1c78ad8191afc816342e09ef317ebd1a64d85dd72d285b6a3
+  CHUNK1_SHA256: 7184f58e54b9b873bf5c8d8b0c57a3d30103384d912432f1a24467086de5950a
+  CHUNK2_SHA256: 3ac024203c4d3c0f73fe3584f60b87c22570ec1939c30849024d1e0bf81e84ef
+  CHUNK3_SHA256: b2bea46722b9acf70b657bf333c4dc7bd7799d1bc32ba184cbb3e30063d1cdf4
+  EXPECTED_CHUNK_CHARS: "48620"
+
+jobs:
+  reconstruct-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require four private benchmark chunks
+        shell: bash
+        env:
+          C0: ${{ secrets.SCC_BENCHMARK_V0613_B64_00 }}
+          C1: ${{ secrets.SCC_BENCHMARK_V0613_B64_01 }}
+          C2: ${{ secrets.SCC_BENCHMARK_V0613_B64_02 }}
+          C3: ${{ secrets.SCC_BENCHMARK_V0613_B64_03 }}
+        run: |
+          set -euo pipefail
+          for n in 0 1 2 3; do
+            v="C$n"
+            [[ -n "${!v:-}" ]] || { echo "::error::SCC_BENCHMARK_V0613_B64_0$n absent"; exit $((80+n)); }
+          done
+
+      - name: Materialize chunks privately and verify chunk identities
+        shell: bash
+        env:
+          C0: ${{ secrets.SCC_BENCHMARK_V0613_B64_00 }}
+          C1: ${{ secrets.SCC_BENCHMARK_V0613_B64_01 }}
+          C2: ${{ secrets.SCC_BENCHMARK_V0613_B64_02 }}
+          C3: ${{ secrets.SCC_BENCHMARK_V0613_B64_03 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/scc-p502/private" "$RUNNER_TEMP/scc-p502/out"
+          printf '%s' "$C0" > "$RUNNER_TEMP/scc-p502/private/c0"
+          printf '%s' "$C1" > "$RUNNER_TEMP/scc-p502/private/c1"
+          printf '%s' "$C2" > "$RUNNER_TEMP/scc-p502/private/c2"
+          printf '%s' "$C3" > "$RUNNER_TEMP/scc-p502/private/c3"
+          unset C0 C1 C2 C3
+          for n in 0 1 2 3; do
+            test "$(wc -c < "$RUNNER_TEMP/scc-p502/private/c$n")" -eq "$EXPECTED_CHUNK_CHARS"
+            expected_var="CHUNK${n}_SHA256"
+            test "$(sha256sum "$RUNNER_TEMP/scc-p502/private/c$n" | awk '{print $1}')" = "${!expected_var}"
+          done
+          cat "$RUNNER_TEMP/scc-p502/private"/c{0,1,2,3} > "$RUNNER_TEMP/scc-p502/private/payload.b64"
+          base64 --decode "$RUNNER_TEMP/scc-p502/private/payload.b64" > "$RUNNER_TEMP/scc-p502/private/tree.pack.xz"
+          test "$(wc -c < "$RUNNER_TEMP/scc-p502/private/tree.pack.xz")" -eq "$EXPECTED_PACK_XZ_BYTES"
+          test "$(sha256sum "$RUNNER_TEMP/scc-p502/private/tree.pack.xz" | awk '{print $1}')" = "$EXPECTED_PACK_XZ_SHA256"
+
+      - name: Decode private tree and reconstruct exact frozen ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -B - <<'PY'
+          import hashlib, json, lzma, os, pathlib, struct, zipfile
+          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p502"
+          packed=(work/"private"/"tree.pack.xz").read_bytes()
+          raw=lzma.decompress(packed,format=lzma.FORMAT_XZ)
+          pos=0
+          magic=b"SCCBT1\0"
+          if raw[:len(magic)]!=magic: raise SystemExit("bad SCCBT1 magic")
+          pos=len(magic)
+          count=struct.unpack_from(">I",raw,pos)[0]; pos+=4
+          if count!=int(os.environ["EXPECTED_MEMBER_COUNT"]): raise SystemExit("wrong payload member count")
+          entries=[]; seen=set()
+          for _ in range(count):
+              nlen=struct.unpack_from(">H",raw,pos)[0]; pos+=2
+              name=raw[pos:pos+nlen].decode("utf-8"); pos+=nlen
+              size=struct.unpack_from(">Q",raw,pos)[0]; pos+=8
+              data=raw[pos:pos+size]; pos+=size
+              p=pathlib.PurePosixPath(name)
+              if p.is_absolute() or ".." in p.parts or name in seen: raise SystemExit("unsafe/duplicate payload member")
+              seen.add(name); entries.append((name,data))
+          if pos!=len(raw): raise SystemExit("trailing SCCBT1 bytes")
+          if [n for n,_ in entries] != sorted(n for n,_ in entries): raise SystemExit("noncanonical payload order")
+          tree=work/"private"/"tree"; tree.mkdir()
+          for name,data in entries:
+              p=tree/name; p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(data)
+          out=work/"private"/"SCC_benchmark_core_v0_6_13.zip"
+          with zipfile.ZipFile(out,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=9,strict_timestamps=True) as zo:
+              for name,data in entries:
+                  zi=zipfile.ZipInfo(name,date_time=(2026,9,20,0,0,0))
+                  zi.create_system=3
+                  zi.external_attr=(0o100644<<16)
+                  zi.compress_type=zipfile.ZIP_DEFLATED
+                  zo.writestr(zi,data,compress_type=zipfile.ZIP_DEFLATED,compresslevel=9)
+          h=hashlib.sha256(out.read_bytes()).hexdigest()
+          if h!=os.environ["EXPECTED_BENCHMARK_ZIP_SHA256"]: raise SystemExit(f"reconstructed ZIP SHA mismatch {h}")
+          if out.stat().st_size!=int(os.environ["EXPECTED_BENCHMARK_ZIP_BYTES"]): raise SystemExit("reconstructed ZIP size mismatch")
+          for fn,ev in [("MANIFEST.json",os.environ["EXPECTED_MANIFEST_SHA256"]),("RELEASE_RECEIPT.json",os.environ["EXPECTED_RELEASE_RECEIPT_SHA256"])]:
+              hh=hashlib.sha256((tree/fn).read_bytes()).hexdigest()
+              if hh!=ev: raise SystemExit(f"{fn} SHA mismatch")
+          rr=json.loads((tree/"RELEASE_RECEIPT.json").read_text())
+          if rr.get("version")!="0.6.13": raise SystemExit("release version mismatch")
+          if rr.get("runtime_surface_sha256")!=os.environ["EXPECTED_RUNTIME_SURFACE_SHA256"]: raise SystemExit("runtime surface parent mismatch")
+          receipt={
+            "schema":"scc-private-benchmark-transport/1",
+            "pass":True,
+            "transport":{
+              "method":"four_github_actions_secret_chunks_sccbt1_xz9e",
+              "secret_chunk_count":4,
+              "chunk_sha256":[os.environ[f"CHUNK{i}_SHA256"] for i in range(4)],
+              "transport_pack_xz_sha256":os.environ["EXPECTED_PACK_XZ_SHA256"],
+              "transport_pack_xz_bytes":int(os.environ["EXPECTED_PACK_XZ_BYTES"])
+            },
+            "reconstruction":{
+              "member_order":"lexicographic",
+              "zip_timestamp":[2026,9,20,0,0,0],
+              "unix_mode":"100644",
+              "compression":"DEFLATE",
+              "compresslevel":9,
+              "member_count":count,
+              "benchmark_zip_bytes":out.stat().st_size,
+              "benchmark_zip_sha256":h,
+              "manifest_sha256":os.environ["EXPECTED_MANIFEST_SHA256"],
+              "release_receipt_sha256":os.environ["EXPECTED_RELEASE_RECEIPT_SHA256"],
+              "runtime_surface_sha256":rr["runtime_surface_sha256"]
+            },
+            "privacy":{
+              "benchmark_uploaded_as_actions_artifact":False,
+              "decoded_tree_uploaded_as_actions_artifact":False,
+              "transport_payload_uploaded_as_actions_artifact":False
+            },
+            "github":{"repository":os.environ.get("GITHUB_REPOSITORY"),"sha":os.environ.get("GITHUB_SHA"),"run_id":os.environ.get("GITHUB_RUN_ID"),"run_attempt":os.environ.get("GITHUB_RUN_ATTEMPT")}
+          }
+          rp=work/"out"/"p502_private_benchmark_transport_receipt.json"
+          rp.write_text(json.dumps(receipt,sort_keys=True,indent=2)+"\n")
+          print(json.dumps({"pass":True,"benchmark_zip_sha256":h,"member_count":count,"runtime_surface_sha256":rr["runtime_surface_sha256"]},sort_keys=True))
+          PY
+          sha256sum "$RUNNER_TEMP/scc-p502/out/p502_private_benchmark_transport_receipt.json"
+
+      - name: Upload non-secret receipt only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-p502-private-benchmark-transport-receipt
+          path: ${{ runner.temp }}/scc-p502/out/p502_private_benchmark_transport_receipt.json
+          if-no-files-found: error
+
+      - name: Attest transport receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/scc-p502/out/p502_private_benchmark_transport_receipt.json
