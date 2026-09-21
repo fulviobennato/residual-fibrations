@@ -23,7 +23,7 @@ Secret values are piped to gh over stdin and are never printed.
 from __future__ import annotations
 import argparse, base64, getpass, hashlib, io, json, lzma, pathlib, shutil, stat, struct, subprocess, sys, zipfile
 
-REPO = "fulviobennato/residual-fibrations"
+DEFAULT_REPO = "fulviobennato/residual-fibrations"
 ADAPTER_SHA = "70a6e3fcbce57b96491b3530401f1f81505b05989c255377c8828785f4ac6bae"
 BENCHMARK_SHA = "35e257503ff1c4d36f30634b19c5da570288dd264ec710331a69dcfed776659c"
 BENCHMARK_MEMBER_COUNT = 243
@@ -91,20 +91,18 @@ def gh(*args: str, input_bytes: bytes | None = None, capture: bool = False) -> s
         check=True,
     )
 
-def set_secret(name: str, value: str) -> None:
+def set_secret(repo: str, name: str, value: str) -> None:
     if not value:
         raise SystemExit(f"refuse empty secret {name}")
-    gh("secret", "set", name, "--repo", REPO, input_bytes=value.encode("utf-8"))
+    gh("secret", "set", name, "--repo", repo, input_bytes=value.encode("utf-8"))
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--adapter-zip", required=True)
     ap.add_argument("--benchmark-zip", required=True)
-    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--repo", default=DEFAULT_REPO)
     args = ap.parse_args()
-
-    global REPO
-    REPO = args.repo
+    repo = args.repo
 
     if shutil.which("gh") is None:
         raise SystemExit("GitHub CLI 'gh' is not installed")
@@ -131,10 +129,10 @@ def main() -> None:
     }
 
     for name, value in values.items():
-        set_secret(name, value)
+        set_secret(repo, name, value)
         print(f"installed {name}", file=sys.stderr)
 
-    result = gh("secret", "list", "--repo", REPO, "--json", "name,updatedAt", capture=True)
+    result = gh("secret", "list", "--repo", repo, "--json", "name,updatedAt", capture=True)
     listing = json.loads(result.stdout.decode("utf-8"))
     present = {x.get("name") for x in listing if isinstance(x, dict)}
     missing = sorted(set(values) - present)
@@ -143,7 +141,7 @@ def main() -> None:
 
     receipt = {
         "schema": "scc-bootstrap-secret-installation-local/1",
-        "repo": REPO,
+        "repo": repo,
         "secret_names": sorted(values),
         "all_secret_names_visible_in_metadata": True,
         "adapter_sha256": ADAPTER_SHA,
