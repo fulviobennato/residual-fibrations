@@ -1,0 +1,145 @@
+name: SCC P476 External Transcript Smoke
+
+on:
+  push:
+    branches:
+      - scc-p476-stdout-custody-smoke
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  transcript:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact branch bytes
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Fetch pinned cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-amd64 -o "$RUNNER_TEMP/cloudflared"
+          printf '%s  %s\n' '03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc' "$RUNNER_TEMP/cloudflared" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/cloudflared"
+
+      - name: Generate synthetic TLS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p476"
+          mkdir -p "$OUT/provider"
+          cat > "$OUT/ca.cnf" <<'EOF'
+          [req]
+          distinguished_name=dn
+          x509_extensions=v3_ca
+          prompt=no
+          [dn]
+          CN=SCC P476 Synthetic CA
+          [v3_ca]
+          basicConstraints=critical,CA:TRUE
+          keyUsage=critical,keyCertSign,cRLSign
+          EOF
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$OUT/ca.key" -out "$OUT/ca.pem" -days 1 -config "$OUT/ca.cnf" >/dev/null 2>&1
+          cat > "$OUT/server.cnf" <<'EOF'
+          [req]
+          distinguished_name=dn
+          req_extensions=req_ext
+          prompt=no
+          [dn]
+          CN=localhost
+          [req_ext]
+          subjectAltName=@alt
+          basicConstraints=critical,CA:FALSE
+          keyUsage=critical,digitalSignature,keyEncipherment
+          extendedKeyUsage=serverAuth
+          [alt]
+          DNS.1=localhost
+          IP.1=127.0.0.1
+          EOF
+          openssl req -newkey rsa:2048 -nodes -keyout "$OUT/server.key" -out "$OUT/server.csr" -config "$OUT/server.cnf" >/dev/null 2>&1
+          openssl x509 -req -in "$OUT/server.csr" -CA "$OUT/ca.pem" -CAkey "$OUT/ca.key" -CAcreateserial -out "$OUT/server.pem" -days 1 -extensions req_ext -extfile "$OUT/server.cnf" >/dev/null 2>&1
+
+      - name: Run two-call externally captured transcript
+        shell: bash
+        env:
+          SCC_GATEWAY_UPSTREAM_TIMEOUT_S: "30"
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p476"
+          SSL_CERT_FILE="$OUT/ca.pem" python scc_p474_gateway_v02/mock_provider.py --port 9443 --cert "$OUT/server.pem" --key "$OUT/server.key" --out-dir "$OUT/provider" >"$OUT/provider.stdout" 2>"$OUT/provider.stderr" &
+          PROVIDER_PID=$!
+          "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --url http://127.0.0.1:8080 >"$OUT/cloudflared.log" 2>&1 &
+          TUNNEL_PID=$!
+          trap 'kill $GATE_PID $TUNNEL_PID $PROVIDER_PID 2>/dev/null || true' EXIT
+          url=""
+          for i in $(seq 1 60); do
+            url="$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' "$OUT/cloudflared.log" | head -1 || true)"
+            [ -n "$url" ] && break
+            sleep 1
+          done
+          [ -n "$url" ] || { cat "$OUT/cloudflared.log" >&2; exit 2; }
+          printf '%s\n' "$url" > "$OUT/tunnel_url.txt"
+
+          SSL_CERT_FILE="$OUT/ca.pem" python -u scc_p474_gateway_v02/gateway_server.py --listen 127.0.0.1 --port 8080 --public-base "$url" --upstream-base https://localhost:9443 --capture "$OUT/raw_capture.jsonl" --provider-scope-id-hash 2222222222222222222222222222222222222222222222222222222222222222 --external-tls-terminated &
+          GATE_PID=$!
+          sleep 1
+
+          for N in 0 1; do
+            N="$N" python - <<'PY'
+          import json,os,pathlib
+          n=int(os.environ["N"])
+          packet={"stage":"STAGE_I_SELECTION","task_id":f"p476_task_{n}","arm_id":f"p476_arm_{n}"}
+          wrapper={"benchmark_packet":packet,"return_payload_only":{}}
+          body={"model":"gpt-test","messages":[{"role":"system","content":"Return JSON only."},{"role":"user","content":json.dumps(wrapper,sort_keys=True,separators=(",",":"))}],"stream":False,"n":1,"response_format":{"type":"json_object"}}
+          p=pathlib.Path(os.environ["RUNNER_TEMP"])/"p476"/f"client_body_{n:03d}.bin"
+          p.write_bytes(json.dumps(body,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode())
+          PY
+            curl -fsS --retry 5 --retry-all-errors --connect-timeout 10 --max-time 30 -H 'Content-Type: application/json' -H 'Authorization: Bearer SYNTHETIC_P476_SMOKE_ONLY' --data-binary @"$OUT/client_body_$(printf '%03d' "$N").bin" "$url/v1/chat/completions" > "$OUT/client_response_$(printf '%03d' "$N").bin"
+          done
+          sleep 1
+          kill "$GATE_PID" "$TUNNEL_PID" "$PROVIDER_PID" 2>/dev/null || true
+          wait "$GATE_PID" 2>/dev/null || true
+
+          python - <<'PY'
+          import base64,hashlib,json,os,pathlib
+          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"p476"
+          events=[json.loads(x) for x in out.joinpath("raw_capture.jsonl").read_text().splitlines()]
+          assert len(events)==2
+          for i,e in enumerate(events):
+              assert e["sequence_index"]==i
+              c=out.joinpath(f"client_body_{i:03d}.bin").read_bytes()
+              p=out.joinpath("provider",f"provider_body_{i:03d}.bin").read_bytes()
+              assert c==p==base64.b64decode(e["request_body_b64"],validate=True)
+              assert e["provider_request_id"]==f"chatcmpl-p476-smoke-{i:04d}"
+              assert e["provider_http_request_id"]==f"req-p476-smoke-{i:04d}"
+          raw=out.joinpath("raw_capture.jsonl").read_bytes()
+          receipt={
+            "protocol":"scc-p476-local-transcript-smoke/0.1",
+            "evidence_status":"LOCAL_SIDE_OF_EXTERNAL_TRANSCRIPT_SMOKE",
+            "event_count":2,
+            "raw_capture_sha256":hashlib.sha256(raw).hexdigest(),
+            "github_sha":os.environ["GITHUB_SHA"],
+            "github_run_id":os.environ["GITHUB_RUN_ID"],
+            "real_model_receipt":False
+          }
+          out.joinpath("P476_LOCAL_TRANSCRIPT_RECEIPT.json").write_text(json.dumps(receipt,sort_keys=True,indent=2)+"\n")
+          print(json.dumps(receipt,sort_keys=True))
+          PY
+
+      - name: Upload local transcript side
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-p476-local-transcript-side
+          path: |
+            ${{ runner.temp }}/p476/raw_capture.jsonl
+            ${{ runner.temp }}/p476/P476_LOCAL_TRANSCRIPT_RECEIPT.json
+          if-no-files-found: error
+
+      - name: Attest local transcript receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/p476/P476_LOCAL_TRANSCRIPT_RECEIPT.json
