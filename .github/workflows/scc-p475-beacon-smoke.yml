@@ -1,0 +1,136 @@
+name: SCC P475 Drand Precommit Smoke
+
+on:
+  push:
+    branches:
+      - scc-p475-beacon-smoke
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  beacon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    env:
+      CHAIN_HASH: 52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971
+    steps:
+      - name: Resolve future quicknet round and prove unavailable
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p475-beacon"
+          mkdir -p "$OUT"
+          curl -fsS "https://api.drand.sh/$CHAIN_HASH/public/latest" > "$OUT/latest.json"
+          python - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ["RUNNER_TEMP"])/"p475-beacon"
+          latest=json.loads((p/"latest.json").read_text())
+          target=int(latest["round"])+20
+          (p/"target_round.txt").write_text(str(target)+"\n")
+          print("latest",latest["round"],"target",target)
+          PY
+          TARGET="$(cat "$OUT/target_round.txt")"
+          status="$(curl -sS -o "$OUT/preavailability_body" -w '%{http_code}' "https://api.drand.sh/$CHAIN_HASH/public/$TARGET")"
+          if [ "$status" = "200" ]; then
+            echo "future target already available; refuse precommit" >&2
+            exit 2
+          fi
+          printf '%s\n' "$status" > "$OUT/preavailability_status.txt"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          p=pathlib.Path(os.environ["RUNNER_TEMP"])/"p475-beacon"
+          latest=json.loads((p/"latest.json").read_text())
+          target=int((p/"target_round.txt").read_text())
+          rec={
+            "protocol":"scc-drand-precommit-smoke/0.1",
+            "evidence_status":"TEMPORAL_PRECOMMIT_SMOKE_NOT_FULL_BEACON_CLOSURE",
+            "beacon_network":"quicknet",
+            "chain_hash":os.environ["CHAIN_HASH"],
+            "latest_observed_round":int(latest["round"]),
+            "target_round":target,
+            "beacon_event_id":f"drand:quicknet:{os.environ['CHAIN_HASH']}:round:{target}",
+            "target_observed_unavailable_before_precommit":True,
+            "preavailability_http_status":(p/"preavailability_status.txt").read_text().strip(),
+            "github_sha":os.environ["GITHUB_SHA"],
+            "github_run_id":os.environ["GITHUB_RUN_ID"]
+          }
+          raw=(json.dumps(rec,sort_keys=True,indent=2)+"\n").encode()
+          (p/"P475_DRAND_PRECOMMIT.json").write_bytes(raw)
+          (p/"precommit_sha256.txt").write_text(hashlib.sha256(raw).hexdigest()+"\n")
+          print(json.dumps(rec,sort_keys=True))
+          PY
+          sha256sum "$OUT/P475_DRAND_PRECOMMIT.json"
+
+      - name: Attest precommit before beacon availability
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/p475-beacon/P475_DRAND_PRECOMMIT.json
+
+      - name: Fetch target round from three independent relays
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p475-beacon"
+          TARGET="$(cat "$OUT/target_round.txt")"
+          fetch_one() {
+            local base="$1" out="$2"
+            for i in $(seq 1 60); do
+              if curl -fsS --max-time 10 "$base/$CHAIN_HASH/public/$TARGET" > "$out"; then return 0; fi
+              sleep 2
+            done
+            return 1
+          }
+          fetch_one https://api.drand.sh "$OUT/r1.json"
+          fetch_one https://api2.drand.sh "$OUT/r2.json"
+          fetch_one https://api3.drand.sh "$OUT/r3.json"
+          python - <<'PY'
+          import hashlib,json,os,pathlib
+          p=pathlib.Path(os.environ["RUNNER_TEMP"])/"p475-beacon"
+          docs=[json.loads((p/f"r{i}.json").read_text()) for i in (1,2,3)]
+          target=int((p/"target_round.txt").read_text())
+          assert all(int(d["round"])==target for d in docs)
+          sigs={d["signature"] for d in docs}; rands={d["randomness"] for d in docs}
+          assert len(sigs)==1 and len(rands)==1
+          sig=bytes.fromhex(next(iter(sigs))); rand=next(iter(rands))
+          assert hashlib.sha256(sig).hexdigest()==rand
+          pre_sha=(p/"precommit_sha256.txt").read_text().strip()
+          rec={
+            "protocol":"scc-drand-beacon-smoke/0.1",
+            "evidence_status":"THREE_RELAY_CONSISTENT_AND_PRECOMMITTED_NOT_BLS_VERIFIED",
+            "chain_hash":os.environ["CHAIN_HASH"],
+            "target_round":target,
+            "beacon_event_id":f"drand:quicknet:{os.environ['CHAIN_HASH']}:round:{target}",
+            "precommit_sha256":pre_sha,
+            "three_relay_round_match":True,
+            "three_relay_signature_match":True,
+            "three_relay_randomness_match":True,
+            "randomness_equals_sha256_signature":True,
+            "bls_signature_verified":False,
+            "signature_sha256":hashlib.sha256(sig).hexdigest(),
+            "randomness_hex":rand,
+            "github_sha":os.environ["GITHUB_SHA"],
+            "github_run_id":os.environ["GITHUB_RUN_ID"],
+            "real_model_receipt":False
+          }
+          raw=(json.dumps(rec,sort_keys=True,indent=2)+"\n").encode()
+          (p/"P475_DRAND_BEACON_RECEIPT.json").write_bytes(raw)
+          print(json.dumps(rec,sort_keys=True))
+          PY
+          sha256sum "$OUT/P475_DRAND_BEACON_RECEIPT.json"
+
+      - name: Upload precommit and beacon smoke receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-p475-drand-beacon-smoke
+          path: |
+            ${{ runner.temp }}/p475-beacon/P475_DRAND_PRECOMMIT.json
+            ${{ runner.temp }}/p475-beacon/P475_DRAND_BEACON_RECEIPT.json
+          if-no-files-found: error
+
+      - name: Attest beacon smoke receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/p475-beacon/P475_DRAND_BEACON_RECEIPT.json
