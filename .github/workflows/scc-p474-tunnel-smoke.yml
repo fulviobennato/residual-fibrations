@@ -1,0 +1,165 @@
+name: SCC P474 Tunnel Smoke
+
+on:
+  push:
+    branches:
+      - scc-p474-tunnel-smoke
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact branch bytes
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Fetch pinned cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-amd64 -o "$RUNNER_TEMP/cloudflared"
+          printf '%s  %s\n' '03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc' "$RUNNER_TEMP/cloudflared" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/cloudflared"
+          "$RUNNER_TEMP/cloudflared" --version
+
+      - name: Generate synthetic local TLS identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p474-smoke"
+          mkdir -p "$OUT/provider"
+          cat > "$OUT/ca.cnf" <<'EOF'
+          [req]
+          distinguished_name=dn
+          x509_extensions=v3_ca
+          prompt=no
+          [dn]
+          CN=SCC P474 Synthetic CA
+          [v3_ca]
+          basicConstraints=critical,CA:TRUE
+          keyUsage=critical,keyCertSign,cRLSign
+          subjectKeyIdentifier=hash
+          authorityKeyIdentifier=keyid:always
+          EOF
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$OUT/ca.key" -out "$OUT/ca.pem" -days 1 -config "$OUT/ca.cnf"
+          cat > "$OUT/server.cnf" <<'EOF'
+          [req]
+          distinguished_name=dn
+          req_extensions=req_ext
+          prompt=no
+          [dn]
+          CN=localhost
+          [req_ext]
+          subjectAltName=@alt
+          basicConstraints=critical,CA:FALSE
+          keyUsage=critical,digitalSignature,keyEncipherment
+          extendedKeyUsage=serverAuth
+          [alt]
+          DNS.1=localhost
+          IP.1=127.0.0.1
+          EOF
+          openssl req -newkey rsa:2048 -nodes -keyout "$OUT/server.key" -out "$OUT/server.csr" -config "$OUT/server.cnf"
+          openssl x509 -req -in "$OUT/server.csr" -CA "$OUT/ca.pem" -CAkey "$OUT/ca.key" -CAcreateserial -out "$OUT/server.pem" -days 1 -extensions req_ext -extfile "$OUT/server.cnf"
+
+      - name: Start local HTTPS mock provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p474-smoke"
+          python scc_p474_gateway_v02/mock_provider.py --port 9443 --cert "$OUT/server.pem" --key "$OUT/server.key" --out-dir "$OUT/provider" >"$OUT/provider.stdout" 2>"$OUT/provider.stderr" &
+          echo $! > "$OUT/provider.pid"
+
+      - name: Start pinned Quick Tunnel and resolve HTTPS URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p474-smoke"
+          "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate --url http://127.0.0.1:8080 >"$OUT/cloudflared.log" 2>&1 &
+          echo $! > "$OUT/cloudflared.pid"
+          url=""
+          for i in $(seq 1 60); do
+            url="$(grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' "$OUT/cloudflared.log" | head -1 || true)"
+            if [ -n "$url" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$url" ]; then cat "$OUT/cloudflared.log" >&2; exit 2; fi
+          printf '%s\n' "$url" > "$OUT/tunnel_url.txt"
+
+      - name: Start exact P474 v0.2 gateway
+        shell: bash
+        env:
+          SCC_GATEWAY_UPSTREAM_TIMEOUT_S: "30"
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p474-smoke"
+          TUNNEL_URL="$(cat "$OUT/tunnel_url.txt")"
+          SSL_CERT_FILE="$OUT/ca.pem" python scc_p474_gateway_v02/gateway_server.py --listen 127.0.0.1 --port 8080 --public-base "$TUNNEL_URL" --upstream-base https://localhost:9443 --capture "$OUT/raw_capture.jsonl" --provider-scope-id-hash 1111111111111111111111111111111111111111111111111111111111111111 --external-tls-terminated >"$OUT/gateway.stdout" 2>"$OUT/gateway.stderr" &
+          echo $! > "$OUT/gateway.pid"
+          sleep 1
+
+      - name: Send one exact synthetic adapter-style request through tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p474-smoke"
+          python - <<'PY'
+          import json, os, pathlib
+          packet={"stage":"STAGE_I_SELECTION","task_id":"tunnel_smoke_task","arm_id":"tunnel_smoke_arm"}
+          wrapper={"benchmark_packet":packet,"return_payload_only":{}}
+          body={"model":"gpt-test","messages":[{"role":"system","content":"Return JSON only."},{"role":"user","content":json.dumps(wrapper,sort_keys=True,separators=(",",":"))}],"stream":False,"n":1,"response_format":{"type":"json_object"}}
+          pathlib.Path(os.environ["RUNNER_TEMP"],"p474-smoke","client_body.bin").write_bytes(json.dumps(body,sort_keys=True,separators=(",",":"),ensure_ascii=True).encode())
+          PY
+          TUNNEL_URL="$(cat "$OUT/tunnel_url.txt")"
+          curl -fsS --retry 5 --retry-all-errors --connect-timeout 10 --max-time 30 -H 'Content-Type: application/json' -H 'Authorization: Bearer SYNTHETIC_P474_SMOKE_ONLY' --data-binary @"$OUT/client_body.bin" "$TUNNEL_URL/v1/chat/completions" > "$OUT/client_response.bin"
+
+      - name: Verify tunnel byte preservation and P474 capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/p474-smoke"
+          python - <<'PY'
+          import base64, hashlib, json, os, pathlib
+          out=pathlib.Path(os.environ["RUNNER_TEMP"])/"p474-smoke"
+          client=out.joinpath("client_body.bin").read_bytes()
+          provider=out.joinpath("provider","provider_body.bin").read_bytes()
+          lines=out.joinpath("raw_capture.jsonl").read_text().splitlines()
+          assert len(lines)==1, len(lines)
+          event=json.loads(lines[0]); captured=base64.b64decode(event["request_body_b64"],validate=True)
+          assert client==captured==provider
+          assert event["request_body_sha256"]==hashlib.sha256(client).hexdigest()
+          assert event["authorization_secret_exported"] is False
+          assert "SYNTHETIC_P474_SMOKE_ONLY" not in lines[0]
+          assert event["provider_reported_model"]=="gpt-test"
+          assert event["provider_request_id"]=="chatcmpl-p474-smoke-0001"
+          assert event["provider_http_request_id"]=="req-p474-smoke-0001"
+          assert event["provider_wire_header_names"]==["host","content-type","authorization","content-length"]
+          ph=json.loads(out.joinpath("provider","provider_headers.json").read_text())
+          assert set(k.lower() for k in ph)=={"host","content-type","authorization","content-length"}
+          assert ph["Authorization"]=="Bearer SYNTHETIC_P474_SMOKE_ONLY"
+          surface=event["semantic_routing_surface"]
+          assert surface["capture_point"]=="POST_GATEWAY_PRE_PROVIDER_APPLICATION_ROUTING"
+          assert surface["nonsecret_provider_bound_headers"]["content-type"]=="application/json"
+          assert surface["nonsecret_provider_bound_headers"]["host"]=="localhost:9443"
+          response=json.loads(out.joinpath("client_response.bin").read_text()); assert response["id"]=="chatcmpl-p474-smoke-0001"
+          receipt={"protocol":"scc-p474-tunnel-smoke/0.1","evidence_status":"TRANSPORT_SMOKE_ONLY_NOT_PROVIDER_EVIDENCE","github_sha":os.environ["GITHUB_SHA"],"github_run_id":os.environ["GITHUB_RUN_ID"],"cloudflared_version":"2026.9.1","cloudflared_sha256":"03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc","gateway_core_sha256":hashlib.sha256(pathlib.Path("scc_p474_gateway_v02/gateway_core.py").read_bytes()).hexdigest(),"gateway_server_sha256":hashlib.sha256(pathlib.Path("scc_p474_gateway_v02/gateway_server.py").read_bytes()).hexdigest(),"client_body_sha256":hashlib.sha256(client).hexdigest(),"captured_body_sha256":event["request_body_sha256"],"provider_body_sha256":hashlib.sha256(provider).hexdigest(),"response_sha256":event["response_body_sha256"],"tunnel_url_sha256":hashlib.sha256(out.joinpath("tunnel_url.txt").read_bytes().strip()).hexdigest(),"byte_preservation_pass":True,"credential_redaction_pass":True,"provider_wire_header_exactness_pass":True,"real_model_receipt":False}
+          out.joinpath("P474_TUNNEL_SMOKE_RECEIPT.json").write_text(json.dumps(receipt,sort_keys=True,indent=2)+"\n")
+          print(json.dumps(receipt,sort_keys=True))
+          PY
+          sha256sum "$OUT/P474_TUNNEL_SMOKE_RECEIPT.json"
+
+      - name: Upload smoke receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-p474-tunnel-smoke-receipt
+          path: ${{ runner.temp }}/p474-smoke/P474_TUNNEL_SMOKE_RECEIPT.json
+          if-no-files-found: error
+
+      - name: Attest smoke receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/p474-smoke/P474_TUNNEL_SMOKE_RECEIPT.json
