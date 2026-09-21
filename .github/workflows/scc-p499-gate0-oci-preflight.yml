@@ -1,0 +1,213 @@
+name: SCC P499 Gate-0 OCI Preflight
+
+on:
+  push:
+    branches:
+      - scc-p499-gate0-oci-preflight
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  gate0-preflight:
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_ADAPTER_ZIP_SHA256: 70a6e3fcbce57b96491b3530401f1f81505b05989c255377c8828785f4ac6bae
+      EXPECTED_DOCKERFILE_SHA256: 7d520949ae01c0ea6305449b32bed561e1a3b77e643bbfee38f1c1a30fb31f9a
+      EXPECTED_ADAPTER_PY_SHA256: e91580cc84f4dedabecc9f64d84154bdcbdd9429f4fd2f9975e42692ad07cf58
+      EXPECTED_CONFIG_SCHEMA_PY_SHA256: e8d1dd2783882fd3f04729248f143d06a3ff1ea11a36f85044640de3cf476b63
+      EXPECTED_MEMBER_COUNT: "17"
+      TARGET_PLATFORM: linux/amd64
+      LOCAL_IMAGE: scc-adapter-v03-gate0-preflight:local
+    steps:
+      - name: Require private adapter source secret
+        shell: bash
+        env:
+          SCC_ADAPTER_V03_ZIP_B64: ${{ secrets.SCC_ADAPTER_V03_ZIP_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SCC_ADAPTER_V03_ZIP_B64:-}" ]]; then
+            echo "::error::SCC_ADAPTER_V03_ZIP_B64 is absent. Gate-0 preflight refuses to build without private source custody."
+            exit 78
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/scc-p499/src" "$RUNNER_TEMP/scc-p499/out"
+          printf '%s' "$SCC_ADAPTER_V03_ZIP_B64" | base64 --decode > "$RUNNER_TEMP/scc-p499/adapter.zip"
+          unset SCC_ADAPTER_V03_ZIP_B64
+          got="$(sha256sum "$RUNNER_TEMP/scc-p499/adapter.zip" | awk '{print $1}')"
+          test "$got" = "$EXPECTED_ADAPTER_ZIP_SHA256" || {
+            echo "::error::adapter ZIP SHA mismatch: $got"
+            exit 2
+          }
+
+      - name: Audit ZIP structure without publishing source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -B - <<'PY'
+          import json, os, stat, zipfile
+          from pathlib import PurePosixPath
+          p=os.path.join(os.environ["RUNNER_TEMP"],"scc-p499","adapter.zip")
+          expected=int(os.environ["EXPECTED_MEMBER_COUNT"])
+          with zipfile.ZipFile(p) as z:
+              infos=z.infolist()
+              if len(infos)!=expected:
+                  raise SystemExit(f"member count {len(infos)} != {expected}")
+              names=[i.filename for i in infos]
+              if len(set(names))!=len(names):
+                  raise SystemExit("duplicate ZIP member")
+              for i in infos:
+                  q=PurePosixPath(i.filename)
+                  if q.is_absolute() or ".." in q.parts:
+                      raise SystemExit(f"unsafe path {i.filename!r}")
+                  mode=(i.external_attr >> 16) & 0o170000
+                  if mode == stat.S_IFLNK:
+                      raise SystemExit(f"symlink member {i.filename!r}")
+          print(json.dumps({"zip_member_count":expected,"zip_structure":"PASS"},sort_keys=True))
+          PY
+          unzip -q "$RUNNER_TEMP/scc-p499/adapter.zip" -d "$RUNNER_TEMP/scc-p499/src"
+
+      - name: Verify frozen source identities
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/scc-p499/src"
+          mapfile -t dfs < <(find "$root" -type f -name Dockerfile -print)
+          mapfile -t aps < <(find "$root" -type f -name adapter.py -print)
+          mapfile -t cps < <(find "$root" -type f -name config_schema.py -print)
+          [[ "${#dfs[@]}" -eq 1 && "${#aps[@]}" -eq 1 && "${#cps[@]}" -eq 1 ]] || {
+            echo "::error::expected exactly one Dockerfile, adapter.py, config_schema.py"
+            exit 3
+          }
+          df="${dfs[0]}"; ap="${aps[0]}"; cp="${cps[0]}"
+          test "$(sha256sum "$df" | awk '{print $1}')" = "$EXPECTED_DOCKERFILE_SHA256"
+          test "$(sha256sum "$ap" | awk '{print $1}')" = "$EXPECTED_ADAPTER_PY_SHA256"
+          test "$(sha256sum "$cp" | awk '{print $1}')" = "$EXPECTED_CONFIG_SCHEMA_PY_SHA256"
+          ctx="$(dirname "$df")"
+          printf 'context=%s\n' "$ctx" >> "$GITHUB_OUTPUT"
+          printf 'dockerfile=%s\n' "$df" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve and pin base image used by frozen Dockerfile
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          df='${{ steps.source.outputs.dockerfile }}'
+          base_ref="$(awk 'BEGIN{IGNORECASE=1} $1=="FROM"{print $2; exit}' "$df")"
+          [[ -n "$base_ref" ]] || { echo "::error::no FROM in Dockerfile"; exit 4; }
+          docker pull "$base_ref" >/dev/null
+          repo_digest="$(docker image inspect "$base_ref" --format '{{index .RepoDigests 0}}')"
+          [[ "$repo_digest" == *@sha256:* ]] || {
+            echo "::error::unable to resolve immutable base repo digest for $base_ref"
+            exit 5
+          }
+          printf 'base_ref=%s\n' "$base_ref" >> "$GITHUB_OUTPUT"
+          printf 'base_repo_digest=%s\n' "$repo_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Build local linux-amd64 image with no source publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          ctx='${{ steps.source.outputs.context }}'
+          df='${{ steps.source.outputs.dockerfile }}'
+          docker build --no-cache --pull=false --platform "$TARGET_PLATFORM" -f "$df" -t "$LOCAL_IMAGE" "$ctx"
+
+      - name: Inspect image and produce source-to-image receipt
+        shell: bash
+        env:
+          BASE_REF: ${{ steps.base.outputs.base_ref }}
+          BASE_REPO_DIGEST: ${{ steps.base.outputs.base_repo_digest }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/scc-p499"
+          cid="$(docker create "$LOCAL_IMAGE")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          docker export "$cid" > "$work/rootfs.tar"
+          mkdir "$work/rootfs"
+          tar -xf "$work/rootfs.tar" -C "$work/rootfs"
+
+          python3 -I -B - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p499"
+          root=work/"rootfs"
+          def hfile(p):
+              h=hashlib.sha256()
+              with p.open("rb") as f:
+                  for b in iter(lambda:f.read(1024*1024),b""): h.update(b)
+              return h.hexdigest()
+          rows=[]
+          for p in sorted(x for x in root.rglob("*") if x.is_file()):
+              rel=p.relative_to(root).as_posix()
+              rows.append((rel,hfile(p),p.stat().st_size))
+          surf=hashlib.sha256()
+          for rel,h,n in rows:
+              surf.update(rel.encode()+b"\0"+h.encode()+b"\0"+str(n).encode()+b"\n")
+          insp=json.loads(subprocess.check_output(["docker","image","inspect",os.environ["LOCAL_IMAGE"]]))[0]
+          cfg=insp.get("Config") or {}
+          critical={}
+          for rel in ("app/adapter.py","app/config_schema.py"):
+              p=root/rel
+              critical["/"+rel]=hfile(p) if p.is_file() else None
+          receipt={
+            "schema":"scc-gate0-oci-preflight/1",
+            "classification":"PREFLIGHT_ONLY_NOT_PROMOTABLE_OCI_CUSTODY",
+            "adapter_zip_sha256":os.environ["EXPECTED_ADAPTER_ZIP_SHA256"],
+            "dockerfile_sha256":os.environ["EXPECTED_DOCKERFILE_SHA256"],
+            "adapter_py_sha256":os.environ["EXPECTED_ADAPTER_PY_SHA256"],
+            "config_schema_py_sha256":os.environ["EXPECTED_CONFIG_SCHEMA_PY_SHA256"],
+            "base_ref":os.environ["BASE_REF"],
+            "base_repo_digest":os.environ["BASE_REPO_DIGEST"],
+            "target_platform":os.environ["TARGET_PLATFORM"],
+            "local_image_id":insp.get("Id"),
+            "architecture":insp.get("Architecture"),
+            "os":insp.get("Os"),
+            "config":{
+              "Entrypoint":cfg.get("Entrypoint"),
+              "Cmd":cfg.get("Cmd"),
+              "WorkingDir":cfg.get("WorkingDir"),
+              "User":cfg.get("User"),
+            },
+            "rootfs_file_count":len(rows),
+            "rootfs_surface_sha256":surf.hexdigest(),
+            "critical_rootfs_file_sha256":critical,
+            "github":{
+              "repository":os.environ.get("GITHUB_REPOSITORY"),
+              "sha":os.environ.get("GITHUB_SHA"),
+              "run_id":os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt":os.environ.get("GITHUB_RUN_ATTEMPT"),
+            },
+            "source_uploaded_as_artifact":False,
+            "image_pushed_to_registry":False,
+            "first_remaining_blocker":"IMMUTABLE_PRIVATE_REGISTRY_IMAGE_AND_REGISTRY_CUSTODY_NOT_YET_ESTABLISHED"
+          }
+          out=work/"out"/"gate0_preflight_receipt.json"
+          out.write_text(json.dumps(receipt,sort_keys=True,indent=2)+"\n")
+          print(json.dumps({
+            "schema":receipt["schema"],
+            "classification":receipt["classification"],
+            "adapter_zip_sha256":receipt["adapter_zip_sha256"],
+            "base_repo_digest":receipt["base_repo_digest"],
+            "local_image_id":receipt["local_image_id"],
+            "rootfs_file_count":receipt["rootfs_file_count"],
+            "rootfs_surface_sha256":receipt["rootfs_surface_sha256"],
+            "config":receipt["config"],
+            "first_remaining_blocker":receipt["first_remaining_blocker"]
+          },sort_keys=True))
+          PY
+          sha256sum "$work/out/gate0_preflight_receipt.json"
+
+      - name: Upload receipt only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-p499-gate0-oci-preflight-receipt
+          path: ${{ runner.temp }}/scc-p499/out/gate0_preflight_receipt.json
+          if-no-files-found: error
+
+      - name: Attest receipt only
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/scc-p499/out/gate0_preflight_receipt.json
