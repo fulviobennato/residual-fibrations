@@ -1,0 +1,150 @@
+name: SCC Private Repo Bootstrap Template
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  private-bootstrap:
+    runs-on: ubuntu-latest
+    env:
+      ADAPTER_ZIP: private_inputs/SCC_external_model_adapter_v0_3.zip
+      BENCHMARK_ZIP: private_inputs/SCC_benchmark_core_v0_6_13.zip
+      EXPECTED_ADAPTER_SHA256: 70a6e3fcbce57b96491b3530401f1f81505b05989c255377c8828785f4ac6bae
+      EXPECTED_BENCHMARK_SHA256: 35e257503ff1c4d36f30634b19c5da570288dd264ec710331a69dcfed776659c
+      EXPECTED_DOCKERFILE_SHA256: 7d520949ae01c0ea6305449b32bed561e1a3b77e643bbfee38f1c1a30fb31f9a
+      EXPECTED_ADAPTER_PY_SHA256: e91580cc84f4dedabecc9f64d84154bdcbdd9429f4fd2f9975e42692ad07cf58
+      EXPECTED_CONFIG_SCHEMA_PY_SHA256: e8d1dd2783882fd3f04729248f143d06a3ff1ea11a36f85044640de3cf476b63
+      TARGET_PLATFORM: linux/amd64
+      REGISTRY: ghcr.io
+
+    steps:
+      - name: Refuse non-private repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ github.event.repository.private }}" = "true" || {
+            echo "::error::This workflow may run only inside a private GitHub repository."
+            exit 78
+          }
+
+      - name: Checkout exact private repository commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify committed frozen inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$ADAPTER_ZIP"
+          test -f "$BENCHMARK_ZIP"
+          test "$(sha256sum "$ADAPTER_ZIP" | awk '{print $1}')" = "$EXPECTED_ADAPTER_SHA256"
+          test "$(sha256sum "$BENCHMARK_ZIP" | awk '{print $1}')" = "$EXPECTED_BENCHMARK_SHA256"
+
+      - name: Extract and verify adapter source identities
+        id: adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/adapter"
+          unzip -q "$ADAPTER_ZIP" -d "$RUNNER_TEMP/adapter"
+          mapfile -t dfs < <(find "$RUNNER_TEMP/adapter" -type f -name Dockerfile -print)
+          mapfile -t aps < <(find "$RUNNER_TEMP/adapter" -type f -name adapter.py -print)
+          mapfile -t cps < <(find "$RUNNER_TEMP/adapter" -type f -name config_schema.py -print)
+          [[ "${#dfs[@]}" -eq 1 && "${#aps[@]}" -eq 1 && "${#cps[@]}" -eq 1 ]] || exit 2
+          test "$(sha256sum "${dfs[0]}" | awk '{print $1}')" = "$EXPECTED_DOCKERFILE_SHA256"
+          test "$(sha256sum "${aps[0]}" | awk '{print $1}')" = "$EXPECTED_ADAPTER_PY_SHA256"
+          test "$(sha256sum "${cps[0]}" | awk '{print $1}')" = "$EXPECTED_CONFIG_SCHEMA_PY_SHA256"
+          echo "context=$(dirname "${dfs[0]}")" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=${dfs[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR with repository GITHUB_TOKEN
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push adapter image
+        id: push
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          image="$REGISTRY/$owner/scc-adapter-v03"
+          tag="bootstrap-${GITHUB_SHA}"
+          ctx='${{ steps.adapter.outputs.context }}'
+          df='${{ steps.adapter.outputs.dockerfile }}'
+          docker build --no-cache --platform "$TARGET_PLATFORM" -f "$df" -t "$image:$tag" "$ctx"
+          docker push "$image:$tag"
+          digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image:$tag" 2>/dev/null || true)"
+          if [[ "$digest" != *@sha256:* ]]; then
+            docker pull "$image:$tag"
+            digest="$(docker inspect --format='{{index .RepoDigests 0}}' "$image:$tag")"
+          fi
+          echo "image_ref=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_name=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Pull by digest and inspect
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.push.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          docker image rm "$IMAGE_REF" >/dev/null 2>&1 || true
+          docker pull "$IMAGE_REF"
+          python3 - <<'PY'
+          import json, os, subprocess
+          ref=os.environ["IMAGE_REF"]
+          obj=json.loads(subprocess.check_output(["docker","image","inspect",ref]))[0]
+          cfg=obj.get("Config") or {}
+          receipt={
+            "schema":"scc-private-repo-bootstrap/1",
+            "repository":os.environ["GITHUB_REPOSITORY"],
+            "repository_private":True,
+            "commit":os.environ["GITHUB_SHA"],
+            "adapter_zip_sha256":os.environ["EXPECTED_ADAPTER_SHA256"],
+            "benchmark_zip_sha256":os.environ["EXPECTED_BENCHMARK_SHA256"],
+            "image_ref":ref,
+            "image_id":obj.get("Id"),
+            "architecture":obj.get("Architecture"),
+            "os":obj.get("Os"),
+            "config":{
+              "Entrypoint":cfg.get("Entrypoint"),
+              "Cmd":cfg.get("Cmd"),
+              "WorkingDir":cfg.get("WorkingDir"),
+              "User":cfg.get("User"),
+            },
+            "transport_secret_count_for_adapter_and_benchmark":0,
+            "ghcr_pat_used":False,
+            "github_token_used":True,
+            "status":"PRIVATE_REPO_BOOTSTRAP_IMAGE_PUSHED_PENDING_PRIVACY_PROOF"
+          }
+          p=os.path.join(os.environ["RUNNER_TEMP"],"private_repo_bootstrap_receipt.json")
+          open(p,"w").write(json.dumps(receipt,sort_keys=True,indent=2)+"\n")
+          print(json.dumps(receipt,sort_keys=True))
+          PY
+
+      - name: Upload non-secret receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-private-repo-bootstrap-receipt
+          path: ${{ runner.temp }}/private_repo_bootstrap_receipt.json
+          if-no-files-found: error
+
+      - name: Attest receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/private_repo_bootstrap_receipt.json
+
+      - name: Attest image subject
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-name: ${{ steps.push.outputs.image_name }}
+          subject-digest: ${{ steps.push.outputs.image_ref }}
