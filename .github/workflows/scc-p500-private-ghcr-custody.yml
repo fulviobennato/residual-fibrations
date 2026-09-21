@@ -8,21 +8,31 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  EXPECTED_ADAPTER_ZIP_SHA256: 70a6e3fcbce57b96491b3530401f1f81505b05989c255377c8828785f4ac6bae
+  EXPECTED_ADAPTER_RECEIPT_SHA256: 61f1b87ab84455946561283decbf1082639846ccdb70969bf6a20cc040c1a4a0
+  EXPECTED_DOCKERFILE_SHA256: 7d520949ae01c0ea6305449b32bed561e1a3b77e643bbfee38f1c1a30fb31f9a
+  EXPECTED_ADAPTER_PY_SHA256: e91580cc84f4dedabecc9f64d84154bdcbdd9429f4fd2f9975e42692ad07cf58
+  EXPECTED_CONFIG_SCHEMA_PY_SHA256: e8d1dd2783882fd3f04729248f143d06a3ff1ea11a36f85044640de3cf476b63
+  EXPECTED_BENCHMARK_SHA256: 35e257503ff1c4d36f30634b19c5da570288dd264ec710331a69dcfed776659c
+  EXPECTED_MEMBER_COUNT: "17"
+  TARGET_PLATFORM: linux/amd64
+  IMAGE_NAME: ghcr.io/fulviobennato/scc-adapter-v03-custodied
+  PACKAGE_NAME: scc-adapter-v03-custodied
+  LOCAL_IMAGE: scc-adapter-v03-p500:local
+
 jobs:
-  private-oci-custody:
+  build-publish:
     runs-on: ubuntu-latest
-    env:
-      EXPECTED_ADAPTER_ZIP_SHA256: 70a6e3fcbce57b96491b3530401f1f81505b05989c255377c8828785f4ac6bae
-      EXPECTED_ADAPTER_RECEIPT_SHA256: 61f1b87ab84455946561283decbf1082639846ccdb70969bf6a20cc040c1a4a0
-      EXPECTED_DOCKERFILE_SHA256: 7d520949ae01c0ea6305449b32bed561e1a3b77e643bbfee38f1c1a30fb31f9a
-      EXPECTED_ADAPTER_PY_SHA256: e91580cc84f4dedabecc9f64d84154bdcbdd9429f4fd2f9975e42692ad07cf58
-      EXPECTED_CONFIG_SCHEMA_PY_SHA256: e8d1dd2783882fd3f04729248f143d06a3ff1ea11a36f85044640de3cf476b63
-      EXPECTED_BENCHMARK_SHA256: 35e257503ff1c4d36f30634b19c5da570288dd264ec710331a69dcfed776659c
-      EXPECTED_MEMBER_COUNT: "17"
-      TARGET_PLATFORM: linux/amd64
-      IMAGE_NAME: ghcr.io/fulviobennato/scc-adapter-v03-custodied
-      PACKAGE_NAME: scc-adapter-v03-custodied
-      LOCAL_IMAGE: scc-adapter-v03-p500:local
+    outputs:
+      manifest_digest: ${{ steps.push.outputs.manifest_digest }}
+      digest_ref: ${{ steps.push.outputs.digest_ref }}
+      base_ref: ${{ steps.recipe.outputs.base_ref }}
+      base_repo_digest: ${{ steps.recipe.outputs.base_repo_digest }}
+      docker_client: ${{ steps.recipe.outputs.docker_client }}
+      docker_server: ${{ steps.recipe.outputs.docker_server }}
+      buildx_version: ${{ steps.recipe.outputs.buildx_version }}
+      recipe_sha: ${{ steps.recipe.outputs.recipe_sha }}
     steps:
       - name: Require private source and registry secrets
         shell: bash
@@ -41,39 +51,30 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          mkdir -p "$RUNNER_TEMP/scc-p500/src" "$RUNNER_TEMP/scc-p500/out"
+          mkdir -p "$RUNNER_TEMP/scc-p500/src"
           printf '%s' "$SCC_ADAPTER_V03_ZIP_B64" | base64 --decode > "$RUNNER_TEMP/scc-p500/adapter.zip"
-          got="$(sha256sum "$RUNNER_TEMP/scc-p500/adapter.zip" | awk '{print $1}')"
-          test "$got" = "$EXPECTED_ADAPTER_ZIP_SHA256" || { echo "::error::adapter ZIP SHA mismatch"; exit 2; }
+          test "$(sha256sum "$RUNNER_TEMP/scc-p500/adapter.zip" | awk '{print $1}')" = "$EXPECTED_ADAPTER_ZIP_SHA256"
           python3 -I -B - <<'PY'
           import os, stat, zipfile
           from pathlib import PurePosixPath
           p=os.path.join(os.environ["RUNNER_TEMP"],"scc-p500","adapter.zip")
           with zipfile.ZipFile(p) as z:
               infos=z.infolist()
-              if len(infos)!=int(os.environ["EXPECTED_MEMBER_COUNT"]):
-                  raise SystemExit("wrong ZIP member count")
-              if len({i.filename for i in infos})!=len(infos):
-                  raise SystemExit("duplicate ZIP member")
+              if len(infos)!=int(os.environ["EXPECTED_MEMBER_COUNT"]): raise SystemExit("wrong ZIP member count")
+              if len({i.filename for i in infos})!=len(infos): raise SystemExit("duplicate ZIP member")
               for i in infos:
                   q=PurePosixPath(i.filename)
-                  if q.is_absolute() or ".." in q.parts:
-                      raise SystemExit("unsafe ZIP path")
-                  mode=(i.external_attr >> 16) & 0o170000
-                  if mode == stat.S_IFLNK:
-                      raise SystemExit("symlink ZIP member")
+                  if q.is_absolute() or ".." in q.parts: raise SystemExit("unsafe ZIP path")
+                  if ((i.external_attr >> 16) & 0o170000) == stat.S_IFLNK: raise SystemExit("symlink ZIP member")
           PY
           unzip -q "$RUNNER_TEMP/scc-p500/adapter.zip" -d "$RUNNER_TEMP/scc-p500/src"
           root="$RUNNER_TEMP/scc-p500/src"
-          for f in Dockerfile adapter.py config_schema.py ADAPTER_RECEIPT.json; do
-            test -f "$root/$f" || { echo "::error::missing $f"; exit 3; }
-          done
           test "$(sha256sum "$root/Dockerfile" | awk '{print $1}')" = "$EXPECTED_DOCKERFILE_SHA256"
           test "$(sha256sum "$root/adapter.py" | awk '{print $1}')" = "$EXPECTED_ADAPTER_PY_SHA256"
           test "$(sha256sum "$root/config_schema.py" | awk '{print $1}')" = "$EXPECTED_CONFIG_SCHEMA_PY_SHA256"
           test "$(sha256sum "$root/ADAPTER_RECEIPT.json" | awk '{print $1}')" = "$EXPECTED_ADAPTER_RECEIPT_SHA256"
 
-      - name: Resolve immutable base and build recipe
+      - name: Resolve immutable base and canonical build recipe
         id: recipe
         shell: bash
         run: |
@@ -83,58 +84,24 @@ jobs:
           [[ -n "$base_ref" ]] || { echo "::error::missing Dockerfile FROM"; exit 4; }
           docker pull --platform "$TARGET_PLATFORM" "$base_ref" >/dev/null
           base_repo_digest="$(docker image inspect "$base_ref" --format '{{index .RepoDigests 0}}')"
-          [[ "$base_repo_digest" == *@sha256:* ]] || { echo "::error::base not resolved to digest"; exit 5; }
-          docker_server="$(docker version --format '{{.Server.Version}}')"
-          buildx_version="$(docker buildx version | tr -d '\r')"
-          python3 -I -B - <<'PY'
-          import hashlib, json, os, pathlib
-          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p500"
-          rec={
-            "adapter_zip_sha256":os.environ["EXPECTED_ADAPTER_ZIP_SHA256"],
-            "dockerfile_sha256":os.environ["EXPECTED_DOCKERFILE_SHA256"],
-            "platform":os.environ["TARGET_PLATFORM"],
-            "base_ref":os.environ["P500_BASE_REF"],
-            "base_repo_digest":os.environ["P500_BASE_REPO_DIGEST"],
-            "docker_server_version":os.environ["P500_DOCKER_SERVER"],
-            "docker_buildx_version":os.environ["P500_BUILDX_VERSION"],
-            "build_command":["docker","build","--no-cache","--pull=false","--platform",os.environ["TARGET_PLATFORM"],"-f","Dockerfile","-t",os.environ["LOCAL_IMAGE"],"."],
-            "image_name":os.environ["IMAGE_NAME"],
-            "github_repository":os.environ.get("GITHUB_REPOSITORY"),
-            "github_sha":os.environ.get("GITHUB_SHA"),
-          }
-          b=json.dumps(rec,sort_keys=True,separators=(",",":")).encode()
-          (work/"build_recipe.json").write_bytes(b+b"\n")
-          print(hashlib.sha256(b).hexdigest())
-          PY
-        env:
-          P500_BASE_REF: python:3.13-slim
-          P500_BASE_REPO_DIGEST: ""
-          P500_DOCKER_SERVER: ""
-          P500_BUILDX_VERSION: ""
-
-      - name: Recreate canonical build recipe with resolved values
-        id: resolved
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/scc-p500/src"
-          base_ref="$(awk 'BEGIN{IGNORECASE=1} $1=="FROM"{print $2; exit}' "$root/Dockerfile")"
-          base_repo_digest="$(docker image inspect "$base_ref" --format '{{index .RepoDigests 0}}')"
+          [[ "$base_repo_digest" == *@sha256:* ]] || { echo "::error::base not resolved to immutable digest"; exit 5; }
+          docker_client="$(docker version --format '{{.Client.Version}}')"
           docker_server="$(docker version --format '{{.Server.Version}}')"
           buildx_version="$(docker buildx version | tr -d '\r')"
           export P500_BASE_REF="$base_ref"
           export P500_BASE_REPO_DIGEST="$base_repo_digest"
+          export P500_DOCKER_CLIENT="$docker_client"
           export P500_DOCKER_SERVER="$docker_server"
           export P500_BUILDX_VERSION="$buildx_version"
           recipe_sha="$(python3 -I -B - <<'PY'
-          import hashlib, json, os, pathlib
-          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p500"
+          import hashlib,json,os
           rec={
             "adapter_zip_sha256":os.environ["EXPECTED_ADAPTER_ZIP_SHA256"],
             "dockerfile_sha256":os.environ["EXPECTED_DOCKERFILE_SHA256"],
             "platform":os.environ["TARGET_PLATFORM"],
             "base_ref":os.environ["P500_BASE_REF"],
             "base_repo_digest":os.environ["P500_BASE_REPO_DIGEST"],
+            "docker_client_version":os.environ["P500_DOCKER_CLIENT"],
             "docker_server_version":os.environ["P500_DOCKER_SERVER"],
             "docker_buildx_version":os.environ["P500_BUILDX_VERSION"],
             "build_command":["docker","build","--no-cache","--pull=false","--platform",os.environ["TARGET_PLATFORM"],"-f","Dockerfile","-t",os.environ["LOCAL_IMAGE"],"."],
@@ -143,13 +110,14 @@ jobs:
             "github_sha":os.environ.get("GITHUB_SHA"),
           }
           b=json.dumps(rec,sort_keys=True,separators=(",",":")).encode()
-          (work/"build_recipe.json").write_bytes(b+b"\n")
           print(hashlib.sha256(b).hexdigest())
           PY
           )"
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
           echo "base_repo_digest=$base_repo_digest" >> "$GITHUB_OUTPUT"
+          echo "docker_client=$docker_client" >> "$GITHUB_OUTPUT"
           echo "docker_server=$docker_server" >> "$GITHUB_OUTPUT"
+          echo "buildx_version=$buildx_version" >> "$GITHUB_OUTPUT"
           echo "recipe_sha=$recipe_sha" >> "$GITHUB_OUTPUT"
 
       - name: Build local frozen adapter image
@@ -169,22 +137,59 @@ jobs:
           image_tag="$IMAGE_NAME:$GITHUB_SHA"
           echo "$SCC_GHCR_PAT" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
           docker tag "$LOCAL_IMAGE" "$image_tag"
-          docker push "$image_tag" 2>&1 | tee "$RUNNER_TEMP/scc-p500/push.log"
-          digest="$(awk '/digest: sha256:/{print $2}' "$RUNNER_TEMP/scc-p500/push.log" | tail -1)"
+          docker push "$image_tag" 2>&1 | tee "$RUNNER_TEMP/push.log"
+          digest="$(awk '/digest: sha256:/{print $2}' "$RUNNER_TEMP/push.log" | tail -1)"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::manifest digest not found"; exit 6; }
           echo "manifest_digest=$digest" >> "$GITHUB_OUTPUT"
           echo "digest_ref=$IMAGE_NAME@$digest" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_MANIFEST_DIGEST=$digest" >> "$GITHUB_ENV"
-          echo "IMAGE_DIGEST_REF=$IMAGE_NAME@$digest" >> "$GITHUB_ENV"
           docker logout ghcr.io >/dev/null || true
 
-      - name: Require concrete GHCR package visibility private
+      - name: Immediate package-private check
         shell: bash
         env:
           SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/scc-p500/package_metadata.json"
+          meta="$(mktemp)"
+          curl -fsSL             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $SCC_GHCR_PAT"             -H "X-GitHub-Api-Version: 2026-03-10"             "https://api.github.com/user/packages/container/$PACKAGE_NAME" > "$meta"
+          python3 -I -B - "$meta" <<'PY'
+          import json,sys
+          x=json.load(open(sys.argv[1],encoding="utf-8"))
+          assert x.get("package_type")=="container", x.get("package_type")
+          assert x.get("visibility")=="private", x.get("visibility")
+          PY
+
+  independent-inspection:
+    needs: build-publish
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_MANIFEST_DIGEST: ${{ needs.build-publish.outputs.manifest_digest }}
+      IMAGE_DIGEST_REF: ${{ needs.build-publish.outputs.digest_ref }}
+      BASE_REF: ${{ needs.build-publish.outputs.base_ref }}
+      BASE_REPO_DIGEST: ${{ needs.build-publish.outputs.base_repo_digest }}
+      DOCKER_CLIENT_BUILD: ${{ needs.build-publish.outputs.docker_client }}
+      DOCKER_SERVER_BUILD: ${{ needs.build-publish.outputs.docker_server }}
+      BUILDX_VERSION_BUILD: ${{ needs.build-publish.outputs.buildx_version }}
+      BUILD_RECIPE_SHA256: ${{ needs.build-publish.outputs.recipe_sha }}
+    steps:
+      - name: Require registry read credential
+        shell: bash
+        env:
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SCC_GHCR_PAT" ]] || { echo "::error::SCC_GHCR_PAT absent"; exit 79; }
+          [[ "$IMAGE_MANIFEST_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$IMAGE_DIGEST_REF" == "$IMAGE_NAME@$IMAGE_MANIFEST_DIGEST" ]]
+
+      - name: Recheck package metadata says private
+        shell: bash
+        env:
+          SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/scc-p500-inspect/out"
+          out="$RUNNER_TEMP/scc-p500-inspect/package_metadata.json"
           curl -fsSL             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $SCC_GHCR_PAT"             -H "X-GitHub-Api-Version: 2026-03-10"             "https://api.github.com/user/packages/container/$PACKAGE_NAME" > "$out"
           python3 -I -B - "$out" <<'PY'
           import json,sys
@@ -200,15 +205,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker logout ghcr.io >/dev/null 2>&1 || true
-          docker image rm -f "$LOCAL_IMAGE" "$IMAGE_NAME:$GITHUB_SHA" >/dev/null 2>&1 || true
-          anon_cfg="$RUNNER_TEMP/scc-p500/anon-docker"
+          anon_cfg="$RUNNER_TEMP/scc-p500-inspect/anon-docker"
           mkdir -p "$anon_cfg"
-          if DOCKER_CONFIG="$anon_cfg" docker pull "$IMAGE_DIGEST_REF" >"$RUNNER_TEMP/scc-p500/anon_pull.log" 2>&1; then
+          if DOCKER_CONFIG="$anon_cfg" docker pull "$IMAGE_DIGEST_REF" >"$RUNNER_TEMP/scc-p500-inspect/anon_pull.log" 2>&1; then
             echo "::error::anonymous pull SUCCEEDED for supposedly private image"
             exit 7
           fi
-          printf '%s\n' "ANONYMOUS_PULL_REJECTED" > "$RUNNER_TEMP/scc-p500/anon_pull_status.txt"
+          echo "ANONYMOUS_PULL_REJECTED" > "$RUNNER_TEMP/scc-p500-inspect/anon_pull_status.txt"
 
       - name: Authenticated pull exact digest
         shell: bash
@@ -216,34 +219,27 @@ jobs:
           SCC_GHCR_PAT: ${{ secrets.SCC_GHCR_PAT }}
         run: |
           set -euo pipefail
-          auth_cfg="$RUNNER_TEMP/scc-p500/auth-docker"
+          auth_cfg="$RUNNER_TEMP/scc-p500-inspect/auth-docker"
           mkdir -p "$auth_cfg"
           echo "$SCC_GHCR_PAT" | DOCKER_CONFIG="$auth_cfg" docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
           DOCKER_CONFIG="$auth_cfg" docker pull "$IMAGE_DIGEST_REF"
-          got="$(docker image inspect "$IMAGE_DIGEST_REF" --format '{{join .RepoDigests "\n"}}' | grep -F "$IMAGE_MANIFEST_DIGEST" | head -1 || true)"
-          [[ -n "$got" ]] || { echo "::error::pulled image not bound to expected digest"; exit 8; }
+          docker image inspect "$IMAGE_DIGEST_REF" >/dev/null
           DOCKER_CONFIG="$auth_cfg" docker logout ghcr.io >/dev/null || true
-          printf '%s\n' "AUTHENTICATED_PULL_PASS" > "$RUNNER_TEMP/scc-p500/auth_pull_status.txt"
+          echo "AUTHENTICATED_PULL_PASS" > "$RUNNER_TEMP/scc-p500-inspect/auth_pull_status.txt"
 
-      - name: Inspect pulled image and write source-to-image receipt
+      - name: Inspect pulled image and write final custody receipt
         shell: bash
-        env:
-          BASE_REF: ${{ steps.resolved.outputs.base_ref }}
-          BASE_REPO_DIGEST: ${{ steps.resolved.outputs.base_repo_digest }}
-          DOCKER_SERVER: ${{ steps.resolved.outputs.docker_server }}
-          BUILD_RECIPE_SHA256: ${{ steps.resolved.outputs.recipe_sha }}
         run: |
           set -euo pipefail
-          work="$RUNNER_TEMP/scc-p500"
+          work="$RUNNER_TEMP/scc-p500-inspect"
           cid="$(docker create "$IMAGE_DIGEST_REF")"
           trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
           docker export "$cid" > "$work/rootfs.tar"
           mkdir "$work/rootfs"
           tar -xf "$work/rootfs.tar" -C "$work/rootfs"
-
           python3 -I -B - <<'PY'
           import hashlib,json,os,pathlib,subprocess
-          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p500"
+          work=pathlib.Path(os.environ["RUNNER_TEMP"])/"scc-p500-inspect"
           root=work/"rootfs"
           def hfile(p):
               h=hashlib.sha256()
@@ -255,10 +251,12 @@ jobs:
           cfg=insp.get("Config") or {}
           adapter=hfile(root/"app/adapter.py")
           schema=hfile(root/"app/config_schema.py")
+          repo_digests=insp.get("RepoDigests") or []
           checks={
             "package_private":pkg.get("visibility")=="private",
             "anonymous_pull_rejected":(work/"anon_pull_status.txt").read_text().strip()=="ANONYMOUS_PULL_REJECTED",
             "authenticated_pull_pass":(work/"auth_pull_status.txt").read_text().strip()=="AUTHENTICATED_PULL_PASS",
+            "pulled_manifest_digest_bound":any(os.environ["IMAGE_MANIFEST_DIGEST"] in x for x in repo_digests),
             "entrypoint":cfg.get("Entrypoint")==["python","/app/adapter.py"],
             "user":cfg.get("User")=="65532:65532",
             "workdir":cfg.get("WorkingDir")=="/app",
@@ -282,31 +280,26 @@ jobs:
               "platform":os.environ["TARGET_PLATFORM"],
               "base_ref":os.environ["BASE_REF"],
               "base_repo_digest":os.environ["BASE_REPO_DIGEST"],
-              "docker_server_version":os.environ["DOCKER_SERVER"],
+              "docker_client_version":os.environ["DOCKER_CLIENT_BUILD"],
+              "docker_server_version":os.environ["DOCKER_SERVER_BUILD"],
+              "docker_buildx_version":os.environ["BUILDX_VERSION_BUILD"],
               "build_recipe_invocation_sha256":os.environ["BUILD_RECIPE_SHA256"],
             },
             "image":{
               "name":os.environ["IMAGE_NAME"],
               "manifest_digest":os.environ["IMAGE_MANIFEST_DIGEST"],
               "digest_ref":os.environ["IMAGE_DIGEST_REF"],
+              "repo_digests":repo_digests,
               "os":insp.get("Os"),
               "architecture":insp.get("Architecture"),
-              "config":{
-                "Entrypoint":cfg.get("Entrypoint"),
-                "Cmd":cfg.get("Cmd"),
-                "WorkingDir":cfg.get("WorkingDir"),
-                "User":cfg.get("User"),
-              },
+              "config":{"Entrypoint":cfg.get("Entrypoint"),"Cmd":cfg.get("Cmd"),"WorkingDir":cfg.get("WorkingDir"),"User":cfg.get("User")},
               "rootfs_app_adapter_py_sha256":adapter,
               "rootfs_app_config_schema_py_sha256":schema,
             },
             "package":pkg,
-            "github":{
-              "repository":os.environ.get("GITHUB_REPOSITORY"),
-              "sha":os.environ.get("GITHUB_SHA"),
-              "run_id":os.environ.get("GITHUB_RUN_ID"),
-              "run_attempt":os.environ.get("GITHUB_RUN_ATTEMPT"),
-            },
+            "github":{"repository":os.environ.get("GITHUB_REPOSITORY"),"sha":os.environ.get("GITHUB_SHA"),"run_id":os.environ.get("GITHUB_RUN_ID"),"run_attempt":os.environ.get("GITHUB_RUN_ATTEMPT")},
+            "inspection_runner_independent_of_build_runner":True,
+            "inspection_job_has_adapter_source_secret":False,
             "source_uploaded_as_public_artifact":False,
           }
           out=work/"out"/"p500_private_oci_custody_receipt.json"
@@ -320,17 +313,17 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: scc-p500-private-oci-custody-receipt
-          path: ${{ runner.temp }}/scc-p500/out/p500_private_oci_custody_receipt.json
+          path: ${{ runner.temp }}/scc-p500-inspect/out/p500_private_oci_custody_receipt.json
           if-no-files-found: error
 
       - name: Attest custody receipt
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: ${{ runner.temp }}/scc-p500/out/p500_private_oci_custody_receipt.json
+          subject-path: ${{ runner.temp }}/scc-p500-inspect/out/p500_private_oci_custody_receipt.json
 
       - name: Attest exact OCI image subject
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
           subject-name: ${{ env.IMAGE_NAME }}
-          subject-digest: ${{ env.IMAGE_MANIFEST_DIGEST }}
+          subject-digest: ${{ needs.build-publish.outputs.manifest_digest }}
           push-to-registry: false
