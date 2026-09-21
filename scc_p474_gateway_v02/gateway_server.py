@@ -2,16 +2,24 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import http.client
 import json
 import os
 import secrets
 import ssl
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from gateway_core import canonical_json_bytes, make_raw_capture_event, sha256_bytes
+from gateway_core import canonical_json_bytes, make_raw_capture_event, routing_surface, sha256_bytes
+
+
+def emit_external_record(prefix: str, obj: dict) -> None:
+    raw = canonical_json_bytes(obj)
+    encoded = base64.b64encode(raw).decode("ascii")
+    print(f"{prefix} {encoded}", flush=True)
 
 
 def append_jsonl(path: Path, obj: dict) -> None:
@@ -98,7 +106,7 @@ class GatewayState:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SCCEvidenceGateway/0.2"
+    server_version = "SCCEvidenceGateway/0.3"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -153,6 +161,31 @@ class Handler(BaseHTTPRequestHandler):
             authorization=auth,
             body=body,
         )
+        request_started_ns = time.time_ns()
+        request_record = {
+            "protocol": "scc-provider-external-request-record/0.1",
+            "sequence_index": sequence_index,
+            "gateway_event_id": gateway_event_id,
+            "gateway_request_started_ns": request_started_ns,
+            "adapter_url": state.public_base + "/v1/chat/completions",
+            "upstream_url": upstream_url,
+            "request_body_b64": base64.b64encode(body).decode("ascii"),
+            "request_body_sha256": sha256_bytes(body),
+            "provider_scope_id_hash": state.provider_scope_id_hash,
+            "semantic_routing_surface": routing_surface(
+                upstream_url=upstream_url,
+                outgoing_headers=wire_headers,
+                request_body=body,
+                provider_scope_id_hash=state.provider_scope_id_hash,
+            ),
+            "provider_wire_headers_redacted": {
+                k.lower(): ("<REDACTED>" if k.lower() == "authorization" else v)
+                for k, v in wire_headers.items()
+            },
+            "authorization_secret_exported": False,
+        }
+        emit_external_record("SCC_PROVIDER_REQUEST_V1", request_record)
+
         timeout = float(os.environ.get("SCC_GATEWAY_UPSTREAM_TIMEOUT_S", "120"))
         try:
             status, raw, response_headers = provider_post_exact(
@@ -164,9 +197,10 @@ class Handler(BaseHTTPRequestHandler):
             network_error = None
         except Exception as exc:
             status = 502
-            raw = json.dumps({"error": {"type": "gateway_upstream_transport_error", "message": str(exc)}} , sort_keys=True, separators=(",", ":")).encode()
+            raw = json.dumps({"error": {"type": "gateway_upstream_transport_error", "message": str(exc)}}, sort_keys=True, separators=(",", ":")).encode()
             response_headers = {"Content-Type": "application/json"}
             network_error = f"{type(exc).__name__}: {exc}"
+        response_received_ns = time.time_ns()
 
         try:
             event = make_raw_capture_event(
@@ -188,6 +222,23 @@ class Handler(BaseHTTPRequestHandler):
                 for k, v in wire_headers.items()
             }
             event["provider_wire_headers_sha256"] = sha256_bytes(canonical_json_bytes(event["provider_wire_headers_redacted"]))
+            event["gateway_request_started_ns"] = request_started_ns
+            event["gateway_response_received_ns"] = response_received_ns
+            response_record = {
+                "protocol": "scc-provider-external-response-record/0.1",
+                "sequence_index": sequence_index,
+                "gateway_event_id": gateway_event_id,
+                "gateway_request_started_ns": request_started_ns,
+                "gateway_response_received_ns": response_received_ns,
+                "response_body_b64": event["response_body_b64"],
+                "response_body_sha256": event["response_body_sha256"],
+                "provider_request_id": event["provider_request_id"],
+                "provider_http_request_id": event["provider_http_request_id"],
+                "provider_reported_model": event["provider_reported_model"],
+                "provider_http_status": status,
+                "provider_transport_error": network_error,
+            }
+            emit_external_record("SCC_PROVIDER_RESPONSE_V1", response_record)
             append_jsonl(state.capture_path, event)
         except Exception as exc:
             self.send_error(502, f"evidence capture failed closed: {exc}")
@@ -197,7 +248,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="SCC provider evidence gateway v0.2 proposed")
+    ap = argparse.ArgumentParser(description="SCC provider evidence gateway v0.3 proposed")
     ap.add_argument("--listen", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8443)
     ap.add_argument("--public-base", required=True)
