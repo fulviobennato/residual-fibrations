@@ -1,0 +1,97 @@
+name: SCC P475 BLS Verify
+
+on:
+  push:
+    branches:
+      - scc-p475-beacon-smoke
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Install exact official drand client
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/p475-bls"
+          mkdir -p "$WORK"
+          cd "$WORK"
+          npm init -y >/dev/null
+          npm install --ignore-scripts --save-exact drand-client@1.4.2
+          node -e 'const p=require("./node_modules/drand-client/package.json"); if(p.version!=="1.4.2") process.exit(2); console.log(p.version)'
+          sha256sum package-lock.json > package-lock.sha256
+
+      - name: Cryptographically verify precommitted quicknet beacon
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/p475-bls"
+          cd "$WORK"
+          cat > verify.mjs <<'EOF'
+          import fs from 'node:fs'
+          import crypto from 'node:crypto'
+          import { quicknetClient, fetchBeacon } from 'drand-client'
+
+          const ROUND = 32385513
+          const CHAIN_HASH = '52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971'
+          const PUBLIC_KEY = '83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a'
+          const EXPECTED_RANDOMNESS = '2a175dcde6e737fd4cb3cb41edcb523d4098e58838f3add2cfb6866bf4790db3'
+          const PRECOMMIT_SHA256 = 'b597ac09e7998d9294e36682fcb01f676ed63e5070f9c9a2bbce061fe4a146d9'
+          const PRECOMMIT_REKOR_INDEX = 2904869541
+          const PRECOMMIT_ATTESTATION = 48831006
+
+          const client = quicknetClient()
+          const info = await client.chain().info()
+          if (info.hash !== CHAIN_HASH) throw new Error('quicknet chain hash mismatch')
+          if (info.public_key !== PUBLIC_KEY) throw new Error('quicknet public key mismatch')
+          if (info.schemeID !== 'bls-unchained-g1-rfc9380') throw new Error('quicknet scheme mismatch')
+          const beacon = await fetchBeacon(client, ROUND)
+          if (beacon.round !== ROUND) throw new Error('round mismatch')
+          if (beacon.randomness !== EXPECTED_RANDOMNESS) throw new Error('randomness mismatch')
+          const sigRandomness = crypto.createHash('sha256').update(Buffer.from(beacon.signature,'hex')).digest('hex')
+          if (sigRandomness !== EXPECTED_RANDOMNESS) throw new Error('signature/randomness hash mismatch')
+
+          const lock = fs.readFileSync('package-lock.json')
+          const receipt = {
+            protocol: 'scc-p475-drand-bls-verification/0.1',
+            evidence_status: 'CRYPTOGRAPHIC_BEACON_VERIFICATION_FOR_PRECOMMITTED_ROUND',
+            official_client: 'drand-client',
+            official_client_version: '1.4.2',
+            package_lock_sha256: crypto.createHash('sha256').update(lock).digest('hex'),
+            chain_hash: CHAIN_HASH,
+            public_key: PUBLIC_KEY,
+            scheme_id: info.schemeID,
+            target_round: ROUND,
+            randomness_hex: beacon.randomness,
+            signature_sha256: sigRandomness,
+            bls_signature_verified: true,
+            precommit_sha256: PRECOMMIT_SHA256,
+            precommit_rekor_index: PRECOMMIT_REKOR_INDEX,
+            precommit_github_attestation: PRECOMMIT_ATTESTATION,
+            github_sha: process.env.GITHUB_SHA,
+            github_run_id: process.env.GITHUB_RUN_ID,
+            real_model_receipt: false
+          }
+          fs.writeFileSync('P475_DRAND_BLS_VERIFICATION_RECEIPT.json', JSON.stringify(receipt,null,2)+'\n')
+          console.log(JSON.stringify(receipt))
+          EOF
+          node verify.mjs
+          sha256sum P475_DRAND_BLS_VERIFICATION_RECEIPT.json
+
+      - name: Upload BLS verification receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: scc-p475-drand-bls-verification
+          path: ${{ runner.temp }}/p475-bls/P475_DRAND_BLS_VERIFICATION_RECEIPT.json
+          if-no-files-found: error
+
+      - name: Attest BLS verification receipt
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/p475-bls/P475_DRAND_BLS_VERIFICATION_RECEIPT.json
